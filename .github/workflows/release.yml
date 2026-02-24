@@ -77,3 +77,22 @@ jobs:
           files: |
             polymarket-*.tar.gz
             checksums.txt
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Update Homebrew formula
+        run: scripts/update-formula.sh ${{ github.ref_name }}
+
+      - name: Commit and push updated formula
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/polymarket.rb
+          git commit -m "brew: update formula for ${{ github.ref_name }}"
+          git push
