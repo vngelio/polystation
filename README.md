@@ -433,7 +433,11 @@ polymarket copy dashboard
 
 # 5) Abrir interfaz web real
 polymarket copy ui --host 127.0.0.1 --port 8787
+# (El CLI imprime un API token; pégalo en la UI para habilitar control seguro)
 ```
+
+
+La UI guarda histórico en una base de datos local JSONL en `~/.config/polymarket/copy_trader_db.jsonl` y usa endpoint incremental de actualizaciones para minimizar latencia de render.
 
 ### Other
 

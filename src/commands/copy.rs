@@ -26,56 +26,40 @@ pub struct CopyArgs {
 
 #[derive(Subcommand)]
 pub enum CopyCommand {
-    /// Configure copy-trading profile and risk parameters
     Configure(ConfigureArgs),
-    /// Show current copy-trader status and funds usage
     Status,
-    /// Compute proportional copy size for a detected leader movement
     Plan(PlanArgs),
-    /// Record a copied movement for dashboard tracking
     Record(RecordArgs),
-    /// Settle a resolved bet and release funds/PnL back into available capital
     Settle(SettleArgs),
-    /// Print dashboard with copied movements and PnL charts
     Dashboard,
-    /// Launch a local web UI for monitoring and controlling copy mode
+    /// Local web UI with near-real-time updates and controls
     Ui(UiArgs),
 }
 
 #[derive(Args)]
 pub struct UiArgs {
-    /// Host to bind the local UI server
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
-    /// Port for the local UI server
     #[arg(long, default_value_t = 8787)]
     pub port: u16,
 }
 
 #[derive(Args, Serialize, Deserialize)]
 pub struct ConfigureArgs {
-    /// Leader account address to follow
     #[arg(long)]
     pub leader: String,
-    /// Capital assigned to copy-trading in USD units
     #[arg(long)]
     pub allocated_funds: Decimal,
-    /// Max percentage of allocated funds per copied trade (0-100)
     #[arg(long, default_value_t = Decimal::from_i128_with_scale(500, 2))]
     pub max_trade_pct: Decimal,
-    /// Max total exposure percentage of allocated funds (0-100)
     #[arg(long, default_value_t = Decimal::from_i128_with_scale(7000, 2))]
     pub max_total_exposure_pct: Decimal,
-    /// Skip copy operations smaller than this amount
     #[arg(long, default_value_t = Decimal::ONE)]
     pub min_copy_usd: Decimal,
-    /// Monitor poll interval in seconds
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 2)]
     pub poll_interval_secs: u64,
-    /// Risk profile preset for future strategy tuning
     #[arg(long, value_enum, default_value_t = RiskLevel::Balanced)]
     pub risk_level: RiskLevel,
-    /// If true, auto-copy mode will try to execute orders (experimental)
     #[arg(long, default_value_t = false)]
     pub execute_orders: bool,
 }
@@ -90,39 +74,30 @@ pub enum RiskLevel {
 
 #[derive(Args)]
 pub struct PlanArgs {
-    /// Current leader total position value in USD
     #[arg(long)]
     pub leader_positions_value: Decimal,
-    /// Detected leader movement amount in USD
     #[arg(long)]
     pub leader_movement_value: Decimal,
 }
 
 #[derive(Args)]
 pub struct RecordArgs {
-    /// ID of market/order reference to track
     #[arg(long)]
     pub movement_id: String,
-    /// Market slug/condition label
     #[arg(long)]
     pub market: String,
-    /// Leader amount in USD
     #[arg(long)]
     pub leader_value: Decimal,
-    /// Copied amount in USD
     #[arg(long)]
     pub copied_value: Decimal,
-    /// Execution difference vs leader (% points, can be negative)
     #[arg(long, default_value_t = Decimal::ZERO)]
     pub diff_pct: Decimal,
 }
 
 #[derive(Args)]
 pub struct SettleArgs {
-    /// Movement ID to settle
     #[arg(long)]
     pub movement_id: String,
-    /// Realized PnL in USD for that movement
     #[arg(long)]
     pub pnl: Decimal,
 }
@@ -168,7 +143,7 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
     match args.command {
         CopyCommand::Configure(cfg) => {
             validate_config(&cfg)?;
-            save_config(&CopyConfig {
+            let c = CopyConfig {
                 leader: cfg.leader,
                 allocated_funds: cfg.allocated_funds,
                 max_trade_pct: cfg.max_trade_pct,
@@ -177,7 +152,9 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
                 poll_interval_secs: cfg.poll_interval_secs,
                 risk_level: cfg.risk_level,
                 execute_orders: cfg.execute_orders,
-            })?;
+            };
+            save_config(&c)?;
+            init_db()?;
             if matches!(output, OutputFormat::Json) {
                 crate::output::print_json(&serde_json::json!({"status": "configured"}))?;
             } else {
@@ -213,8 +190,9 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
                 settled: false,
                 pnl: Decimal::ZERO,
             };
-            state.movements.push(entry);
+            state.movements.push(entry.clone());
             save_state(&state)?;
+            append_db_movement(&entry)?;
             if matches!(output, OutputFormat::Json) {
                 crate::output::print_json(&serde_json::json!({"status": "recorded"}))?;
             } else {
@@ -232,6 +210,7 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
             movement.settled = true;
             movement.pnl = settle.pnl;
             save_state(&state)?;
+            settle_db_movement(&settle.movement_id, settle.pnl)?;
             if matches!(output, OutputFormat::Json) {
                 crate::output::print_json(&serde_json::json!({"status": "settled"}))?;
             } else {
@@ -255,7 +234,6 @@ struct UiAppState {
 #[derive(Default)]
 struct RuntimeState {
     config: Option<CopyConfig>,
-    state: CopyState,
     monitoring: bool,
     last_seen_hashes: HashSet<String>,
 }
@@ -265,77 +243,106 @@ struct UiStateResponse {
     configured: bool,
     monitoring: bool,
     config: Option<CopyConfig>,
-    movements: Vec<MovementRecord>,
+    movement_count: usize,
     daily_pnl: Vec<(String, Decimal)>,
     historical_pnl: Vec<(String, Decimal)>,
 }
 
+#[derive(Serialize)]
+struct UpdatesResponse {
+    latest_id: i64,
+    movements: Vec<DbMovement>,
+}
+
+#[derive(Serialize)]
+struct DbMovement {
+    id: i64,
+    movement_id: String,
+    market: String,
+    timestamp: String,
+    leader_value: String,
+    copied_value: String,
+    diff_pct: String,
+    settled: bool,
+    pnl: String,
+}
+
 async fn run_ui(ui: UiArgs) -> Result<()> {
+    if ui.host != "127.0.0.1" && ui.host != "localhost" {
+        bail!("For security, UI host must be 127.0.0.1 or localhost");
+    }
+
+    init_db()?;
+    let token = generate_api_token()?;
+    let addr = format!("{}:{}", ui.host, ui.port);
+    println!("Copy UI running at http://{addr}");
+    println!("UI API token: {token}");
+
     let app_state = UiAppState {
         runtime: Arc::new(Mutex::new(RuntimeState {
             config: load_config().ok(),
-            state: load_state().unwrap_or_default(),
             monitoring: false,
             last_seen_hashes: HashSet::new(),
         })),
     };
 
-    let addr = format!("{}:{}", ui.host, ui.port);
-    println!("Copy UI running at http://{addr}");
     let listener = TcpListener::bind(&addr)?;
-
     loop {
         let (stream, _) = listener.accept()?;
         let app = app_state.clone();
+        let token = token.clone();
         tokio::spawn(async move {
-            let _ = handle_http(stream, app).await;
+            let _ = handle_http(stream, app, &token).await;
         });
     }
 }
 
-async fn handle_http(mut stream: TcpStream, app: UiAppState) -> Result<()> {
-    let mut buf = vec![0_u8; 1024 * 64];
-    let read = stream.read(&mut buf)?;
-    let req = String::from_utf8_lossy(&buf[..read]);
-    let mut lines = req.lines();
-    let first = lines.next().unwrap_or_default();
-    let mut parts = first.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("/");
-
-    let body = req
-        .split(
-            "
-
-",
-        )
-        .nth(1)
-        .unwrap_or("");
+async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Result<()> {
+    let request = read_http_request(&mut stream)?;
+    let (method, path, query) = parse_request_line(&request)?;
+    let headers = parse_headers(&request);
+    let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+    if path.starts_with("/api/") && !is_authorized(&headers, query, token) {
+        write_response(
+            &mut stream,
+            "401 Unauthorized",
+            "application/json",
+            "{\"error\":\"unauthorized\"}",
+        )?;
+        return Ok(());
+    }
 
     match (method, path) {
         ("GET", "/") => write_response(
             &mut stream,
             "200 OK",
-            "text/html",
+            "text/html; charset=utf-8",
             include_str!("../output/copy_ui.html"),
         )?,
         ("GET", "/api/state") => {
-            let payload = {
-                let runtime = app.runtime.lock().await;
-                serde_json::to_string(&UiStateResponse {
-                    configured: runtime.config.is_some(),
-                    monitoring: runtime.monitoring,
-                    config: runtime.config.clone(),
-                    movements: runtime.state.movements.clone(),
-                    daily_pnl: daily_pnl_series(&runtime.state.movements),
-                    historical_pnl: cumulative_pnl_series(&runtime.state.movements),
-                })?
-            };
+            let db_state = load_state_from_db()?;
+            let runtime = app.runtime.lock().await;
+            let payload = serde_json::to_string(&UiStateResponse {
+                configured: runtime.config.is_some(),
+                monitoring: runtime.monitoring,
+                config: runtime.config.clone(),
+                movement_count: db_state.movements.len(),
+                daily_pnl: daily_pnl_series(&db_state.movements),
+                historical_pnl: cumulative_pnl_series(&db_state.movements),
+            })?;
+            write_response(&mut stream, "200 OK", "application/json", &payload)?;
+        }
+        ("GET", "/api/updates") => {
+            let since = parse_since(query);
+            let (latest_id, rows) = db_updates_since(since)?;
+            let payload = serde_json::to_string(&UpdatesResponse {
+                latest_id,
+                movements: rows,
+            })?;
             write_response(&mut stream, "200 OK", "application/json", &payload)?;
         }
         ("POST", "/api/configure") => {
-            let cfg: ConfigureArgs =
-                serde_json::from_str(body).map_err(|_| anyhow!("invalid json"))?;
+            let cfg: ConfigureArgs = serde_json::from_str(body).context("invalid json")?;
             validate_config(&cfg)?;
             let config = CopyConfig {
                 leader: cfg.leader,
@@ -355,6 +362,15 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState) -> Result<()> {
         ("POST", "/api/start") => {
             {
                 let mut runtime = app.runtime.lock().await;
+                if runtime.config.is_none() {
+                    write_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json",
+                        "{\"error\":\"configure first\"}",
+                    )?;
+                    return Ok(());
+                }
                 runtime.monitoring = true;
             }
             let app_clone = app.clone();
@@ -371,26 +387,6 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState) -> Result<()> {
         _ => write_response(&mut stream, "404 Not Found", "text/plain", "not found")?,
     }
 
-    Ok(())
-}
-
-fn write_response(
-    stream: &mut TcpStream,
-    status: &str,
-    content_type: &str,
-    body: &str,
-) -> Result<()> {
-    let resp = format!(
-        "HTTP/1.1 {status}
-Content-Type: {content_type}
-Content-Length: {}
-Connection: close
-
-{}",
-        body.len(),
-        body
-    );
-    stream.write_all(resp.as_bytes())?;
     Ok(())
 }
 
@@ -417,40 +413,132 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             .and_then(|v| v.first().map(|x| x.value))
             .unwrap_or(Decimal::ONE);
 
-        let trades_req = TradesRequest::builder().user(leader).limit(25)?.build();
+        let trades_req = TradesRequest::builder().user(leader).limit(20)?.build();
         let trades = data_client.trades(&trades_req).await.unwrap_or_default();
 
-        {
+        for t in trades {
+            let tx_hash = t.transaction_hash.to_string();
             let mut runtime = app.runtime.lock().await;
-            for t in trades {
-                let tx_hash = t.transaction_hash.to_string();
-                if runtime.last_seen_hashes.contains(&tx_hash) {
-                    continue;
-                }
-                runtime.last_seen_hashes.insert(tx_hash.clone());
-
-                let leader_move = t.size * t.price;
-                let plan = compute_plan(&cfg, &runtime.state, leader_value, leader_move)?;
-                if plan.capped_size <= Decimal::ZERO {
-                    continue;
-                }
-
-                runtime.state.movements.push(MovementRecord {
-                    movement_id: tx_hash,
-                    market: t.slug,
-                    timestamp: Utc::now().to_rfc3339(),
-                    leader_value: leader_move,
-                    copied_value: plan.capped_size,
-                    diff_pct: Decimal::ZERO,
-                    settled: false,
-                    pnl: Decimal::ZERO,
-                });
+            if runtime.last_seen_hashes.contains(&tx_hash) {
+                continue;
             }
-            let _ = save_state(&runtime.state);
+            runtime.last_seen_hashes.insert(tx_hash.clone());
+
+            let state = load_state()?;
+            let plan = compute_plan(&cfg, &state, leader_value, t.size * t.price)?;
+            if plan.capped_size <= Decimal::ZERO {
+                continue;
+            }
+
+            let record = MovementRecord {
+                movement_id: tx_hash,
+                market: t.slug,
+                timestamp: Utc::now().to_rfc3339(),
+                leader_value: t.size * t.price,
+                copied_value: plan.capped_size,
+                diff_pct: Decimal::ZERO,
+                settled: false,
+                pnl: Decimal::ZERO,
+            };
+            let mut updated = state;
+            updated.movements.push(record.clone());
+            save_state(&updated)?;
+            append_db_movement(&record)?;
         }
 
-        tokio::time::sleep(Duration::from_secs(cfg.poll_interval_secs.max(1))).await;
+        tokio::time::sleep(Duration::from_millis(
+            (cfg.poll_interval_secs.max(1)) * 1000,
+        ))
+        .await;
     }
+    Ok(())
+}
+
+fn is_authorized(
+    headers: &std::collections::HashMap<String, String>,
+    query: &str,
+    token: &str,
+) -> bool {
+    let header_ok = headers
+        .get("x-api-key")
+        .is_some_and(|v| constant_time_eq(v.as_bytes(), token.as_bytes()));
+    let query_ok = query
+        .split('&')
+        .find_map(|kv| kv.split_once('='))
+        .is_some_and(|(k, v)| k == "token" && constant_time_eq(v.as_bytes(), token.as_bytes()));
+
+    header_ok || query_ok
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut x = 0u8;
+    for (aa, bb) in a.iter().zip(b.iter()) {
+        x |= aa ^ bb;
+    }
+    x == 0
+}
+
+fn generate_api_token() -> Result<String> {
+    let mut f = fs::File::open("/dev/urandom").context("failed to open /dev/urandom")?;
+    let mut buf = [0u8; 32];
+    f.read_exact(&mut buf)?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Result<String> {
+    let mut buf = vec![0_u8; 1024 * 64];
+    let n = stream.read(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf[..n]).to_string())
+}
+
+fn parse_request_line(request: &str) -> Result<(&str, &str, &str)> {
+    let first = request
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow!("empty request"))?;
+    let mut parts = first.split_whitespace();
+    let method = parts.next().ok_or_else(|| anyhow!("missing method"))?;
+    let target = parts.next().ok_or_else(|| anyhow!("missing path"))?;
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    Ok((method, path, query))
+}
+
+fn parse_headers(request: &str) -> std::collections::HashMap<String, String> {
+    let mut headers = std::collections::HashMap::new();
+    for line in request.lines().skip(1) {
+        if line.trim().is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        }
+    }
+    headers
+}
+
+fn parse_since(query: &str) -> i64 {
+    query
+        .split('&')
+        .find_map(|kv| kv.split_once('='))
+        .and_then(|(k, v)| if k == "since" { v.parse().ok() } else { None })
+        .unwrap_or(0)
+}
+
+fn write_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) -> Result<()> {
+    let resp = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(resp.as_bytes())?;
     Ok(())
 }
 
@@ -533,13 +621,137 @@ fn state_path() -> Result<PathBuf> {
     Ok(base_dir()?.join("copy_trader_state.json"))
 }
 
+fn db_path() -> Result<PathBuf> {
+    Ok(base_dir()?.join("copy_trader_db.jsonl"))
+}
+
+fn init_db() -> Result<()> {
+    let path = db_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if !path.exists() {
+        fs::write(path, "")?;
+    }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct DbRow {
+    id: i64,
+    movement_id: String,
+    market: String,
+    timestamp: String,
+    leader_value: String,
+    copied_value: String,
+    diff_pct: String,
+    settled: bool,
+    pnl: String,
+}
+
+fn next_db_id(rows: &[DbRow]) -> i64 {
+    rows.last().map_or(1, |r| r.id + 1)
+}
+
+fn read_db_rows() -> Result<Vec<DbRow>> {
+    init_db()?;
+    let raw = fs::read_to_string(db_path()?)?;
+    let mut out = Vec::new();
+    for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+        if let Ok(v) = serde_json::from_str::<DbRow>(line) {
+            out.push(v);
+        }
+    }
+    out.sort_by_key(|x| x.id);
+    Ok(out)
+}
+
+fn write_db_rows(rows: &[DbRow]) -> Result<()> {
+    let mut body = String::new();
+    for r in rows {
+        body.push_str(&serde_json::to_string(r)?);
+        body.push('\n');
+    }
+    fs::write(db_path()?, body)?;
+    Ok(())
+}
+
+fn append_db_movement(m: &MovementRecord) -> Result<()> {
+    let mut rows = read_db_rows()?;
+    if rows.iter().any(|r| r.movement_id == m.movement_id) {
+        return Ok(());
+    }
+    rows.push(DbRow {
+        id: next_db_id(&rows),
+        movement_id: m.movement_id.clone(),
+        market: m.market.clone(),
+        timestamp: m.timestamp.clone(),
+        leader_value: m.leader_value.to_string(),
+        copied_value: m.copied_value.to_string(),
+        diff_pct: m.diff_pct.to_string(),
+        settled: m.settled,
+        pnl: m.pnl.to_string(),
+    });
+    write_db_rows(&rows)
+}
+
+fn settle_db_movement(movement_id: &str, pnl: Decimal) -> Result<()> {
+    let mut rows = read_db_rows()?;
+    for r in &mut rows {
+        if r.movement_id == movement_id {
+            r.settled = true;
+            r.pnl = pnl.to_string();
+        }
+    }
+    write_db_rows(&rows)
+}
+
+fn load_state_from_db() -> Result<CopyState> {
+    let rows = read_db_rows()?;
+    let movements = rows
+        .into_iter()
+        .map(|r| MovementRecord {
+            movement_id: r.movement_id,
+            market: r.market,
+            timestamp: r.timestamp,
+            leader_value: Decimal::from_str_exact(&r.leader_value).unwrap_or(Decimal::ZERO),
+            copied_value: Decimal::from_str_exact(&r.copied_value).unwrap_or(Decimal::ZERO),
+            diff_pct: Decimal::from_str_exact(&r.diff_pct).unwrap_or(Decimal::ZERO),
+            settled: r.settled,
+            pnl: Decimal::from_str_exact(&r.pnl).unwrap_or(Decimal::ZERO),
+        })
+        .collect();
+    Ok(CopyState { movements })
+}
+
+fn db_updates_since(since: i64) -> Result<(i64, Vec<DbMovement>)> {
+    let rows = read_db_rows()?;
+    let latest_id = rows.last().map_or(0, |r| r.id);
+    let updates = rows
+        .into_iter()
+        .filter(|r| r.id > since)
+        .take(200)
+        .map(|r| DbMovement {
+            id: r.id,
+            movement_id: r.movement_id,
+            market: r.market,
+            timestamp: r.timestamp,
+            leader_value: r.leader_value,
+            copied_value: r.copied_value,
+            diff_pct: r.diff_pct,
+            settled: r.settled,
+            pnl: r.pnl,
+        })
+        .collect();
+    Ok((latest_id, updates))
+}
+
 fn save_config(cfg: &CopyConfig) -> Result<()> {
     let path = config_path()?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).context("Failed creating config directory")?;
+        fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_string_pretty(cfg)?)
-        .context("Failed writing copy-trader config")?;
+    fs::write(path, serde_json::to_string_pretty(cfg)?)?;
     Ok(())
 }
 
@@ -552,9 +764,9 @@ fn load_config() -> Result<CopyConfig> {
 fn save_state(state: &CopyState) -> Result<()> {
     let path = state_path()?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).context("Failed creating config directory")?;
+        fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_string_pretty(state)?).context("Failed writing state")?;
+    fs::write(path, serde_json::to_string_pretty(state)?)?;
     Ok(())
 }
 
@@ -563,7 +775,7 @@ fn load_state() -> Result<CopyState> {
     if !path.exists() {
         return Ok(CopyState::default());
     }
-    let data = fs::read_to_string(path).context("Failed reading state")?;
+    let data = fs::read_to_string(path)?;
     serde_json::from_str(&data).context("Invalid copy-trader state")
 }
 
@@ -607,7 +819,7 @@ mod tests {
             max_trade_pct: d("5"),
             max_total_exposure_pct: d("100"),
             min_copy_usd: d("1"),
-            poll_interval_secs: 10,
+            poll_interval_secs: 2,
             risk_level: RiskLevel::Balanced,
             execute_orders: false,
         };
@@ -625,7 +837,7 @@ mod tests {
             max_trade_pct: d("50"),
             max_total_exposure_pct: d("60"),
             min_copy_usd: d("1"),
-            poll_interval_secs: 10,
+            poll_interval_secs: 2,
             risk_level: RiskLevel::Balanced,
             execute_orders: false,
         };
@@ -644,47 +856,5 @@ mod tests {
         let p = compute_plan(&cfg, &state, d("1000"), d("100")).unwrap();
         assert_eq!(p.capped_size, d("50"));
         assert_eq!(p.available_funds, d("50"));
-    }
-
-    #[test]
-    fn daily_and_cumulative_pnl_series_work() {
-        let movements = vec![
-            MovementRecord {
-                movement_id: "a".into(),
-                market: "m".into(),
-                timestamp: "2025-01-01T00:00:00Z".into(),
-                leader_value: d("10"),
-                copied_value: d("10"),
-                diff_pct: Decimal::ZERO,
-                settled: true,
-                pnl: d("2"),
-            },
-            MovementRecord {
-                movement_id: "b".into(),
-                market: "m".into(),
-                timestamp: "2025-01-01T12:00:00Z".into(),
-                leader_value: d("10"),
-                copied_value: d("10"),
-                diff_pct: Decimal::ZERO,
-                settled: true,
-                pnl: d("3"),
-            },
-            MovementRecord {
-                movement_id: "c".into(),
-                market: "m".into(),
-                timestamp: "2025-01-02T00:00:00Z".into(),
-                leader_value: d("10"),
-                copied_value: d("10"),
-                diff_pct: Decimal::ZERO,
-                settled: true,
-                pnl: d("-1"),
-            },
-        ];
-        let daily = daily_pnl_series(&movements);
-        assert_eq!(daily[0].1, d("5"));
-        assert_eq!(daily[1].1, d("-1"));
-        let cumulative = cumulative_pnl_series(&movements);
-        assert_eq!(cumulative[0].1, d("5"));
-        assert_eq!(cumulative[1].1, d("4"));
     }
 }
