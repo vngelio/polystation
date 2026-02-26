@@ -430,6 +430,9 @@ polymarket copy settle --movement-id ORD123 --pnl 1.2
 # 4) Check status/dashboard (includes daily + historical PnL charts in terminal)
 polymarket copy status
 polymarket copy dashboard
+
+# 5) Abrir interfaz web real
+polymarket copy ui --host 127.0.0.1 --port 8787
 ```
 
 ### Other

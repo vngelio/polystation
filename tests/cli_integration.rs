@@ -96,7 +96,8 @@ fn copy_help_lists_subcommands() {
                 .and(predicate::str::contains("plan"))
                 .and(predicate::str::contains("record"))
                 .and(predicate::str::contains("settle"))
-                .and(predicate::str::contains("dashboard")),
+                .and(predicate::str::contains("dashboard"))
+                .and(predicate::str::contains("ui")),
         );
 }
 

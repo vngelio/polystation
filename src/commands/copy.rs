@@ -1,12 +1,22 @@
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Args, Subcommand, ValueEnum};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 use crate::output::OutputFormat;
+use polymarket_client_sdk::data::types::request::{TradesRequest, ValueRequest};
 
 #[derive(Args)]
 pub struct CopyArgs {
@@ -28,9 +38,21 @@ pub enum CopyCommand {
     Settle(SettleArgs),
     /// Print dashboard with copied movements and PnL charts
     Dashboard,
+    /// Launch a local web UI for monitoring and controlling copy mode
+    Ui(UiArgs),
 }
 
 #[derive(Args)]
+pub struct UiArgs {
+    /// Host to bind the local UI server
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+    /// Port for the local UI server
+    #[arg(long, default_value_t = 8787)]
+    pub port: u16,
+}
+
+#[derive(Args, Serialize, Deserialize)]
 pub struct ConfigureArgs {
     /// Leader account address to follow
     #[arg(long)]
@@ -53,6 +75,9 @@ pub struct ConfigureArgs {
     /// Risk profile preset for future strategy tuning
     #[arg(long, value_enum, default_value_t = RiskLevel::Balanced)]
     pub risk_level: RiskLevel,
+    /// If true, auto-copy mode will try to execute orders (experimental)
+    #[arg(long, default_value_t = false)]
+    pub execute_orders: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum)]
@@ -102,7 +127,7 @@ pub struct SettleArgs {
     pub pnl: Decimal,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CopyConfig {
     pub leader: String,
     pub allocated_funds: Decimal,
@@ -111,6 +136,7 @@ pub struct CopyConfig {
     pub min_copy_usd: Decimal,
     pub poll_interval_secs: u64,
     pub risk_level: RiskLevel,
+    pub execute_orders: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -150,6 +176,7 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
                 min_copy_usd: cfg.min_copy_usd,
                 poll_interval_secs: cfg.poll_interval_secs,
                 risk_level: cfg.risk_level,
+                execute_orders: cfg.execute_orders,
             })?;
             if matches!(output, OutputFormat::Json) {
                 crate::output::print_json(&serde_json::json!({"status": "configured"}))?;
@@ -216,7 +243,215 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
             let state = load_state()?;
             crate::output::copy::print_dashboard(&state, output)
         }
+        CopyCommand::Ui(ui) => run_ui(ui).await,
     }
+}
+
+#[derive(Clone)]
+struct UiAppState {
+    runtime: Arc<Mutex<RuntimeState>>,
+}
+
+#[derive(Default)]
+struct RuntimeState {
+    config: Option<CopyConfig>,
+    state: CopyState,
+    monitoring: bool,
+    last_seen_hashes: HashSet<String>,
+}
+
+#[derive(Serialize)]
+struct UiStateResponse {
+    configured: bool,
+    monitoring: bool,
+    config: Option<CopyConfig>,
+    movements: Vec<MovementRecord>,
+    daily_pnl: Vec<(String, Decimal)>,
+    historical_pnl: Vec<(String, Decimal)>,
+}
+
+async fn run_ui(ui: UiArgs) -> Result<()> {
+    let app_state = UiAppState {
+        runtime: Arc::new(Mutex::new(RuntimeState {
+            config: load_config().ok(),
+            state: load_state().unwrap_or_default(),
+            monitoring: false,
+            last_seen_hashes: HashSet::new(),
+        })),
+    };
+
+    let addr = format!("{}:{}", ui.host, ui.port);
+    println!("Copy UI running at http://{addr}");
+    let listener = TcpListener::bind(&addr)?;
+
+    loop {
+        let (stream, _) = listener.accept()?;
+        let app = app_state.clone();
+        tokio::spawn(async move {
+            let _ = handle_http(stream, app).await;
+        });
+    }
+}
+
+async fn handle_http(mut stream: TcpStream, app: UiAppState) -> Result<()> {
+    let mut buf = vec![0_u8; 1024 * 64];
+    let read = stream.read(&mut buf)?;
+    let req = String::from_utf8_lossy(&buf[..read]);
+    let mut lines = req.lines();
+    let first = lines.next().unwrap_or_default();
+    let mut parts = first.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("/");
+
+    let body = req
+        .split(
+            "
+
+",
+        )
+        .nth(1)
+        .unwrap_or("");
+
+    match (method, path) {
+        ("GET", "/") => write_response(
+            &mut stream,
+            "200 OK",
+            "text/html",
+            include_str!("../output/copy_ui.html"),
+        )?,
+        ("GET", "/api/state") => {
+            let payload = {
+                let runtime = app.runtime.lock().await;
+                serde_json::to_string(&UiStateResponse {
+                    configured: runtime.config.is_some(),
+                    monitoring: runtime.monitoring,
+                    config: runtime.config.clone(),
+                    movements: runtime.state.movements.clone(),
+                    daily_pnl: daily_pnl_series(&runtime.state.movements),
+                    historical_pnl: cumulative_pnl_series(&runtime.state.movements),
+                })?
+            };
+            write_response(&mut stream, "200 OK", "application/json", &payload)?;
+        }
+        ("POST", "/api/configure") => {
+            let cfg: ConfigureArgs =
+                serde_json::from_str(body).map_err(|_| anyhow!("invalid json"))?;
+            validate_config(&cfg)?;
+            let config = CopyConfig {
+                leader: cfg.leader,
+                allocated_funds: cfg.allocated_funds,
+                max_trade_pct: cfg.max_trade_pct,
+                max_total_exposure_pct: cfg.max_total_exposure_pct,
+                min_copy_usd: cfg.min_copy_usd,
+                poll_interval_secs: cfg.poll_interval_secs,
+                risk_level: cfg.risk_level,
+                execute_orders: cfg.execute_orders,
+            };
+            save_config(&config)?;
+            let mut runtime = app.runtime.lock().await;
+            runtime.config = Some(config);
+            write_response(&mut stream, "200 OK", "application/json", "{\"ok\":true}")?;
+        }
+        ("POST", "/api/start") => {
+            {
+                let mut runtime = app.runtime.lock().await;
+                runtime.monitoring = true;
+            }
+            let app_clone = app.clone();
+            tokio::spawn(async move {
+                let _ = monitor_loop(app_clone).await;
+            });
+            write_response(&mut stream, "200 OK", "application/json", "{\"ok\":true}")?;
+        }
+        ("POST", "/api/stop") => {
+            let mut runtime = app.runtime.lock().await;
+            runtime.monitoring = false;
+            write_response(&mut stream, "200 OK", "application/json", "{\"ok\":true}")?;
+        }
+        _ => write_response(&mut stream, "404 Not Found", "text/plain", "not found")?,
+    }
+
+    Ok(())
+}
+
+fn write_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) -> Result<()> {
+    let resp = format!(
+        "HTTP/1.1 {status}
+Content-Type: {content_type}
+Content-Length: {}
+Connection: close
+
+{}",
+        body.len(),
+        body
+    );
+    stream.write_all(resp.as_bytes())?;
+    Ok(())
+}
+
+async fn monitor_loop(app: UiAppState) -> Result<()> {
+    let data_client = polymarket_client_sdk::data::Client::default();
+    loop {
+        let (running, cfg) = {
+            let runtime = app.runtime.lock().await;
+            (runtime.monitoring, runtime.config.clone())
+        };
+        if !running {
+            break;
+        }
+        let Some(cfg) = cfg else {
+            break;
+        };
+
+        let leader = crate::commands::parse_address(&cfg.leader)?;
+        let value_req = ValueRequest::builder().user(leader).build();
+        let leader_value = data_client
+            .value(&value_req)
+            .await
+            .ok()
+            .and_then(|v| v.first().map(|x| x.value))
+            .unwrap_or(Decimal::ONE);
+
+        let trades_req = TradesRequest::builder().user(leader).limit(25)?.build();
+        let trades = data_client.trades(&trades_req).await.unwrap_or_default();
+
+        {
+            let mut runtime = app.runtime.lock().await;
+            for t in trades {
+                let tx_hash = t.transaction_hash.to_string();
+                if runtime.last_seen_hashes.contains(&tx_hash) {
+                    continue;
+                }
+                runtime.last_seen_hashes.insert(tx_hash.clone());
+
+                let leader_move = t.size * t.price;
+                let plan = compute_plan(&cfg, &runtime.state, leader_value, leader_move)?;
+                if plan.capped_size <= Decimal::ZERO {
+                    continue;
+                }
+
+                runtime.state.movements.push(MovementRecord {
+                    movement_id: tx_hash,
+                    market: t.slug,
+                    timestamp: Utc::now().to_rfc3339(),
+                    leader_value: leader_move,
+                    copied_value: plan.capped_size,
+                    diff_pct: Decimal::ZERO,
+                    settled: false,
+                    pnl: Decimal::ZERO,
+                });
+            }
+            let _ = save_state(&runtime.state);
+        }
+
+        tokio::time::sleep(Duration::from_secs(cfg.poll_interval_secs.max(1))).await;
+    }
+    Ok(())
 }
 
 fn validate_config(cfg: &ConfigureArgs) -> Result<()> {
@@ -374,6 +609,7 @@ mod tests {
             min_copy_usd: d("1"),
             poll_interval_secs: 10,
             risk_level: RiskLevel::Balanced,
+            execute_orders: false,
         };
         let state = CopyState::default();
         let p = compute_plan(&cfg, &state, d("1000"), d("200")).unwrap();
@@ -391,6 +627,7 @@ mod tests {
             min_copy_usd: d("1"),
             poll_interval_secs: 10,
             risk_level: RiskLevel::Balanced,
+            execute_orders: false,
         };
         let state = CopyState {
             movements: vec![MovementRecord {
