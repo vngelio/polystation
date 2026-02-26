@@ -437,12 +437,11 @@ polymarket copy ui --host 127.0.0.1 --port 8787
 ```
 
 
-La UI guarda histórico en una base de datos local JSONL en `~/.config/polymarket/copy_trader_db.jsonl` y usa endpoint incremental de actualizaciones para minimizar latencia de render.
+La UI guarda histórico en una base de datos local JSONL en `~/.config/polymarket/copy_trader_real_db.jsonl` (real) y `~/.config/polymarket/copy_trader_sim_db.jsonl` (simulación) y usa endpoint incremental de actualizaciones para minimizar latencia de render.
 
-Desde la UI puedes activar una casilla de **Modo tiempo real**.
-- Desactivada: se usan los valores por defecto actuales de consulta.
-- Activada: permite bajar hasta **50ms** (límite sostenible teórico para `/trades` según 200 req / 10s).
-Si la API devuelve errores de exceso de consultas (rate limit/429), la UI mostrará aviso y el bot subirá automáticamente el intervalo en bloques de **250ms**.
+La UI tiene dos pestañas mutuamente excluyentes: **Modo real** y **Modo simulación**.
+- En **Modo real** puedes activar además la casilla de **Modo tiempo real** para bajar hasta 50ms (siempre con backoff automático +250ms en rate-limit/429).
+- En **Modo simulación** se desactiva el modo real y se simula la copia proporcional de movimientos usando la misma lógica de riesgo, incluyendo ganancias/pérdidas simuladas al resolver movimientos.
 
 ### Other
 

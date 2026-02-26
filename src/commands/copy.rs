@@ -67,6 +67,8 @@ pub struct ConfigureArgs {
     pub execute_orders: bool,
     #[arg(long, default_value_t = false)]
     pub realtime_mode: bool,
+    #[arg(long, default_value_t = false)]
+    pub simulation_mode: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum)]
@@ -121,6 +123,8 @@ pub struct CopyConfig {
     pub execute_orders: bool,
     #[serde(default)]
     pub realtime_mode: bool,
+    #[serde(default)]
+    pub simulation_mode: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -179,9 +183,10 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
                 risk_level: cfg.risk_level,
                 execute_orders: cfg.execute_orders,
                 realtime_mode: cfg.realtime_mode,
+                simulation_mode: cfg.simulation_mode,
             };
             save_config(&c)?;
-            init_db()?;
+            init_db(StorageMode::Real)?;
             if matches!(output, OutputFormat::Json) {
                 crate::output::print_json(&serde_json::json!({"status": "configured"}))?;
             } else {
@@ -219,7 +224,7 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
             };
             state.movements.push(entry.clone());
             save_state(&state)?;
-            append_db_movement(&entry)?;
+            append_db_movement(current_mode_from_disk(), &entry)?;
             if matches!(output, OutputFormat::Json) {
                 crate::output::print_json(&serde_json::json!({"status": "recorded"}))?;
             } else {
@@ -237,7 +242,7 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
             movement.settled = true;
             movement.pnl = settle.pnl;
             save_state(&state)?;
-            settle_db_movement(&settle.movement_id, settle.pnl)?;
+            settle_db_movement(current_mode_from_disk(), &settle.movement_id, settle.pnl)?;
             if matches!(output, OutputFormat::Json) {
                 crate::output::print_json(&serde_json::json!({"status": "settled"}))?;
             } else {
@@ -265,6 +270,7 @@ struct RuntimeState {
     current_poll_interval_ms: u64,
     warning: Option<String>,
     last_seen_hashes: HashSet<String>,
+    simulation_tick: u64,
 }
 
 #[derive(Serialize)]
@@ -274,6 +280,7 @@ struct UiStateResponse {
     config: Option<CopyConfig>,
     current_poll_interval_ms: u64,
     warning: Option<String>,
+    active_mode: String,
     movement_count: usize,
     daily_pnl: Vec<(String, Decimal)>,
     historical_pnl: Vec<(String, Decimal)>,
@@ -303,7 +310,7 @@ async fn run_ui(ui: UiArgs) -> Result<()> {
         bail!("For security, UI host must be 127.0.0.1 or localhost");
     }
 
-    init_db()?;
+    init_db(StorageMode::Real)?;
     let token = generate_api_token()?;
     let addr = format!("{}:{}", ui.host, ui.port);
     println!("Copy UI running at http://{addr}");
@@ -319,6 +326,7 @@ async fn run_ui(ui: UiArgs) -> Result<()> {
                 .unwrap_or(default_poll_interval_ms()),
             warning: None,
             last_seen_hashes: HashSet::new(),
+            simulation_tick: 0,
         })),
     };
 
@@ -356,14 +364,27 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
             include_str!("../output/copy_ui.html"),
         )?,
         ("GET", "/api/state") => {
-            let db_state = load_state_from_db()?;
             let runtime = app.runtime.lock().await;
+            let mode = current_mode_from_runtime(&runtime);
+            let db_state = load_state_from_db(mode)?;
             let payload = serde_json::to_string(&UiStateResponse {
                 configured: runtime.config.is_some(),
                 monitoring: runtime.monitoring,
                 config: runtime.config.clone(),
                 current_poll_interval_ms: runtime.current_poll_interval_ms,
                 warning: runtime.warning.clone(),
+                active_mode: runtime
+                    .config
+                    .as_ref()
+                    .map(|c| {
+                        if c.simulation_mode {
+                            "simulacion"
+                        } else {
+                            "real"
+                        }
+                    })
+                    .unwrap_or("real")
+                    .to_string(),
                 movement_count: db_state.movements.len(),
                 daily_pnl: daily_pnl_series(&db_state.movements),
                 historical_pnl: cumulative_pnl_series(&db_state.movements),
@@ -372,7 +393,9 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
         }
         ("GET", "/api/updates") => {
             let since = parse_since(query);
-            let (latest_id, rows) = db_updates_since(since)?;
+            let runtime = app.runtime.lock().await;
+            let mode = current_mode_from_runtime(&runtime);
+            let (latest_id, rows) = db_updates_since(mode, since)?;
             let payload = serde_json::to_string(&UpdatesResponse {
                 latest_id,
                 movements: rows,
@@ -397,6 +420,7 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
                 risk_level: cfg.risk_level,
                 execute_orders: cfg.execute_orders,
                 realtime_mode: cfg.realtime_mode,
+                simulation_mode: cfg.simulation_mode,
             };
             save_config(&config)?;
             let mut runtime = app.runtime.lock().await;
@@ -458,6 +482,12 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
         let Some(cfg) = cfg else {
             break;
         };
+
+        if cfg.simulation_mode {
+            simulation_step(&app, &cfg)?;
+            tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+            continue;
+        }
 
         let leader = crate::commands::parse_address(&cfg.leader)?;
         let value_req = ValueRequest::builder().user(leader).build();
@@ -521,11 +551,67 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             let mut updated = state;
             updated.movements.push(record.clone());
             save_state(&updated)?;
-            append_db_movement(&record)?;
+            append_db_movement(StorageMode::Real, &record)?;
         }
 
         tokio::time::sleep(Duration::from_millis(poll_ms)).await;
     }
+    Ok(())
+}
+
+fn simulation_step(app: &UiAppState, cfg: &CopyConfig) -> Result<()> {
+    let mut runtime = app.runtime.blocking_lock();
+    runtime.simulation_tick = runtime.simulation_tick.saturating_add(1);
+
+    let mut state = load_state()?;
+    let tick = runtime.simulation_tick;
+    let leader_movement = Decimal::from((tick % 7 + 1) as i64) * Decimal::from(5);
+    let plan = compute_plan(
+        cfg,
+        &state,
+        cfg.allocated_funds.max(Decimal::ONE),
+        leader_movement,
+    )?;
+
+    if plan.capped_size > Decimal::ZERO {
+        let movement_id = format!("sim-{}", tick);
+        let market = format!("sim-market-{}", tick % 5);
+        let record = MovementRecord {
+            movement_id,
+            market,
+            timestamp: Utc::now().to_rfc3339(),
+            leader_value: leader_movement,
+            copied_value: plan.capped_size,
+            diff_pct: Decimal::ZERO,
+            settled: false,
+            pnl: Decimal::ZERO,
+        };
+        state.movements.push(record.clone());
+        append_db_movement(StorageMode::Simulation, &record)?;
+    }
+
+    // Simulate resolution of older open movements with pseudo-random pnl
+    for m in &mut state.movements {
+        if m.settled {
+            continue;
+        }
+        let should_settle = (tick + m.movement_id.len() as u64).is_multiple_of(3);
+        if should_settle {
+            let sign = if (tick + m.market.len() as u64).is_multiple_of(2) {
+                1
+            } else {
+                -1
+            };
+            let magnitude = Decimal::from(((tick % 4) + 1) as i64) / Decimal::from(20); // 5%-20%
+            m.pnl = m.copied_value * magnitude * Decimal::from(sign);
+            m.settled = true;
+            settle_db_movement(StorageMode::Simulation, &m.movement_id, m.pnl)?;
+        }
+    }
+
+    save_state(&state)?;
+    runtime.warning =
+        Some("Modo simulación activo: movimientos y resolución simulados".to_string());
     Ok(())
 }
 
@@ -637,6 +723,9 @@ fn validate_config(cfg: &ConfigureArgs) -> Result<()> {
     if cfg.min_copy_usd < Decimal::ZERO {
         bail!("min-copy-usd cannot be negative");
     }
+    if cfg.realtime_mode && cfg.simulation_mode {
+        bail!("realtime-mode and simulation-mode are mutually exclusive");
+    }
     if let Some(ms) = cfg.poll_interval_ms
         && ms < min_poll_ms(cfg.realtime_mode)
     {
@@ -706,12 +795,16 @@ fn state_path() -> Result<PathBuf> {
     Ok(base_dir()?.join("copy_trader_state.json"))
 }
 
-fn db_path() -> Result<PathBuf> {
-    Ok(base_dir()?.join("copy_trader_db.jsonl"))
+fn db_path(mode: StorageMode) -> Result<PathBuf> {
+    let filename = match mode {
+        StorageMode::Real => "copy_trader_real_db.jsonl",
+        StorageMode::Simulation => "copy_trader_sim_db.jsonl",
+    };
+    Ok(base_dir()?.join(filename))
 }
 
-fn init_db() -> Result<()> {
-    let path = db_path()?;
+fn init_db(mode: StorageMode) -> Result<()> {
+    let path = db_path(mode)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -719,6 +812,38 @@ fn init_db() -> Result<()> {
         fs::write(path, "")?;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum StorageMode {
+    Real,
+    Simulation,
+}
+
+fn mode_from_simulation(simulation_mode: bool) -> StorageMode {
+    if simulation_mode {
+        StorageMode::Simulation
+    } else {
+        StorageMode::Real
+    }
+}
+
+fn mode_from_config(cfg: &CopyConfig) -> StorageMode {
+    mode_from_simulation(cfg.simulation_mode)
+}
+
+fn current_mode_from_runtime(runtime: &RuntimeState) -> StorageMode {
+    runtime
+        .config
+        .as_ref()
+        .map(mode_from_config)
+        .unwrap_or(StorageMode::Real)
+}
+
+fn current_mode_from_disk() -> StorageMode {
+    load_config()
+        .map(|c| mode_from_config(&c))
+        .unwrap_or(StorageMode::Real)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -738,9 +863,9 @@ fn next_db_id(rows: &[DbRow]) -> i64 {
     rows.last().map_or(1, |r| r.id + 1)
 }
 
-fn read_db_rows() -> Result<Vec<DbRow>> {
-    init_db()?;
-    let raw = fs::read_to_string(db_path()?)?;
+fn read_db_rows(mode: StorageMode) -> Result<Vec<DbRow>> {
+    init_db(mode)?;
+    let raw = fs::read_to_string(db_path(mode)?)?;
     let mut out = Vec::new();
     for line in raw.lines().filter(|l| !l.trim().is_empty()) {
         if let Ok(v) = serde_json::from_str::<DbRow>(line) {
@@ -751,18 +876,18 @@ fn read_db_rows() -> Result<Vec<DbRow>> {
     Ok(out)
 }
 
-fn write_db_rows(rows: &[DbRow]) -> Result<()> {
+fn write_db_rows(mode: StorageMode, rows: &[DbRow]) -> Result<()> {
     let mut body = String::new();
     for r in rows {
         body.push_str(&serde_json::to_string(r)?);
         body.push('\n');
     }
-    fs::write(db_path()?, body)?;
+    fs::write(db_path(mode)?, body)?;
     Ok(())
 }
 
-fn append_db_movement(m: &MovementRecord) -> Result<()> {
-    let mut rows = read_db_rows()?;
+fn append_db_movement(mode: StorageMode, m: &MovementRecord) -> Result<()> {
+    let mut rows = read_db_rows(mode)?;
     if rows.iter().any(|r| r.movement_id == m.movement_id) {
         return Ok(());
     }
@@ -777,22 +902,22 @@ fn append_db_movement(m: &MovementRecord) -> Result<()> {
         settled: m.settled,
         pnl: m.pnl.to_string(),
     });
-    write_db_rows(&rows)
+    write_db_rows(mode, &rows)
 }
 
-fn settle_db_movement(movement_id: &str, pnl: Decimal) -> Result<()> {
-    let mut rows = read_db_rows()?;
+fn settle_db_movement(mode: StorageMode, movement_id: &str, pnl: Decimal) -> Result<()> {
+    let mut rows = read_db_rows(mode)?;
     for r in &mut rows {
         if r.movement_id == movement_id {
             r.settled = true;
             r.pnl = pnl.to_string();
         }
     }
-    write_db_rows(&rows)
+    write_db_rows(mode, &rows)
 }
 
-fn load_state_from_db() -> Result<CopyState> {
-    let rows = read_db_rows()?;
+fn load_state_from_db(mode: StorageMode) -> Result<CopyState> {
+    let rows = read_db_rows(mode)?;
     let movements = rows
         .into_iter()
         .map(|r| MovementRecord {
@@ -809,8 +934,8 @@ fn load_state_from_db() -> Result<CopyState> {
     Ok(CopyState { movements })
 }
 
-fn db_updates_since(since: i64) -> Result<(i64, Vec<DbMovement>)> {
-    let rows = read_db_rows()?;
+fn db_updates_since(mode: StorageMode, since: i64) -> Result<(i64, Vec<DbMovement>)> {
+    let rows = read_db_rows(mode)?;
     let latest_id = rows.last().map_or(0, |r| r.id);
     let updates = rows
         .into_iter()
@@ -909,6 +1034,7 @@ mod tests {
             risk_level: RiskLevel::Balanced,
             execute_orders: false,
             realtime_mode: false,
+            simulation_mode: false,
         };
         let state = CopyState::default();
         let p = compute_plan(&cfg, &state, d("1000"), d("200")).unwrap();
@@ -929,6 +1055,7 @@ mod tests {
             risk_level: RiskLevel::Balanced,
             execute_orders: false,
             realtime_mode: false,
+            simulation_mode: false,
         };
         let state = CopyState {
             movements: vec![MovementRecord {
