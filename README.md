@@ -406,6 +406,32 @@ polymarket shell
 
 Supports command history. All commands work the same as the CLI, just without the `polymarket` prefix.
 
+
+### Copy Trading Assistant (new)
+
+Configure a leader account and copy movements proportionally to your allocated capital, with risk caps and exposure controls.
+
+```bash
+# 1) Configure
+polymarket copy configure \
+  --leader 0xLEADER... \
+  --allocated-funds 1000 \
+  --max-trade-pct 5 \
+  --max-total-exposure-pct 70 \
+  --min-copy-usd 1
+
+# 2) For each detected leader movement, compute safe proportional size
+polymarket copy plan --leader-positions-value 25000 --leader-movement-value 100
+
+# 3) Record copied movement and settle once resolved
+polymarket copy record --movement-id ORD123 --market election-2028 --leader-value 100 --copied-value 4 --diff-pct -0.4
+polymarket copy settle --movement-id ORD123 --pnl 1.2
+
+# 4) Check status/dashboard (includes daily + historical PnL charts in terminal)
+polymarket copy status
+polymarket copy dashboard
+```
+
 ### Other
 
 ```bash

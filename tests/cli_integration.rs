@@ -28,7 +28,8 @@ fn help_lists_all_top_level_commands() {
             .and(predicate::str::contains("data"))
             .and(predicate::str::contains("bridge"))
             .and(predicate::str::contains("wallet"))
-            .and(predicate::str::contains("status")),
+            .and(predicate::str::contains("status"))
+            .and(predicate::str::contains("copy")),
     );
 }
 
@@ -81,6 +82,31 @@ fn wallet_help_lists_subcommands() {
                 .and(predicate::str::contains("show"))
                 .and(predicate::str::contains("reset")),
         );
+}
+
+#[test]
+fn copy_help_lists_subcommands() {
+    polymarket()
+        .args(["copy", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("configure")
+                .and(predicate::str::contains("status"))
+                .and(predicate::str::contains("plan"))
+                .and(predicate::str::contains("record"))
+                .and(predicate::str::contains("settle"))
+                .and(predicate::str::contains("dashboard")),
+        );
+}
+
+#[test]
+fn copy_status_requires_configuration() {
+    polymarket()
+        .args(["copy", "status"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Copy-trader is not configured"));
 }
 
 #[test]
