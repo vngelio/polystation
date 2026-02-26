@@ -14,6 +14,7 @@ body{font-family:system-ui,Arial;margin:20px} input{margin:4px} table{border-col
 <input id="maxTrade" placeholder="Max trade %" value="5"/>
 <input id="maxExposure" placeholder="Max exposure %" value="70"/>
 <input id="minCopy" placeholder="Min copy USD" value="1"/>
+<label><input type="checkbox" id="realtimeMode" onchange="toggleRealtime()"/> Modo tiempo real</label>
 <input id="pollMs" type="number" min="500" step="250" placeholder="Poll ms" value="2000"/>
 <label><input type="checkbox" id="execute"/> Execute orders (experimental)</label>
 <button onclick="configure()">Guardar config</button>
@@ -37,7 +38,8 @@ async function api(path,opts={}){
   return r.json();
 }
 async function configure(){
- const payload={leader:leader.value,allocated_funds:funds.value,max_trade_pct:maxTrade.value,max_total_exposure_pct:maxExposure.value,min_copy_usd:minCopy.value,poll_interval_secs:Math.max(1,Math.round(Number(pollMs.value)/1000)),poll_interval_ms:Math.max(500,Number(pollMs.value)||2000),risk_level:'balanced',execute_orders:execute.checked};
+ const rt = realtimeMode.checked; const minMs = rt ? 50 : 500;
+ const payload={leader:leader.value,allocated_funds:funds.value,max_trade_pct:maxTrade.value,max_total_exposure_pct:maxExposure.value,min_copy_usd:minCopy.value,poll_interval_secs:Math.max(1,Math.round(Number(pollMs.value)/1000)),poll_interval_ms:Math.max(minMs,Number(pollMs.value)||2000),risk_level:'balanced',execute_orders:execute.checked,realtime_mode:rt};
  await api('/api/configure',{method:'POST',body:JSON.stringify(payload)});
  await fullRefresh();
 }
@@ -63,12 +65,14 @@ async function fullRefresh(){
    status.textContent = `Configured: ${s.configured} | Monitoring: ${s.monitoring} | Poll: ${s.current_poll_interval_ms}ms | Movimientos: ${s.movement_count}`;
    status.className = s.warning ? 'bad' : 'ok';
    if(s.warning){ status.textContent += ` | Aviso: ${s.warning}`; }
-   if(s.config){leader.value=s.config.leader; funds.value=s.config.allocated_funds; maxTrade.value=s.config.max_trade_pct; maxExposure.value=s.config.max_total_exposure_pct; minCopy.value=s.config.min_copy_usd; execute.checked=!!s.config.execute_orders;} pollMs.value=s.current_poll_interval_ms || 2000;
+   if(s.config){leader.value=s.config.leader; funds.value=s.config.allocated_funds; maxTrade.value=s.config.max_trade_pct; maxExposure.value=s.config.max_total_exposure_pct; minCopy.value=s.config.min_copy_usd; execute.checked=!!s.config.execute_orders; realtimeMode.checked=!!s.config.realtime_mode;} pollMs.value=s.current_poll_interval_ms || 2000; toggleRealtime();
    daily.textContent = (s.daily_pnl||[]).map(d=>`${d[0]} ${bars(Number(d[1]))} ${d[1]}`).join('\n');
    historical.textContent = (s.historical_pnl||[]).map(d=>`${d[0]} ${bars(Number(d[1]))} ${d[1]}`).join('\n');
  }catch(e){status.textContent='Error: '+e.message; status.className='bad'}
 }
+function toggleRealtime(){ if(realtimeMode.checked){ pollMs.min=50; pollMs.step=250; if(Number(pollMs.value)<50) pollMs.value=50; } else { pollMs.min=500; pollMs.step=250; if(Number(pollMs.value)<500) pollMs.value=2000; }}
 setInterval(pollUpdates,500);
 setInterval(fullRefresh,4000);
+toggleRealtime();
 </script>
 </body></html>

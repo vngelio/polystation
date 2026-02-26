@@ -65,6 +65,8 @@ pub struct ConfigureArgs {
     pub risk_level: RiskLevel,
     #[arg(long, default_value_t = false)]
     pub execute_orders: bool,
+    #[arg(long, default_value_t = false)]
+    pub realtime_mode: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum)]
@@ -117,6 +119,8 @@ pub struct CopyConfig {
     pub poll_interval_ms: u64,
     pub risk_level: RiskLevel,
     pub execute_orders: bool,
+    #[serde(default)]
+    pub realtime_mode: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -148,6 +152,14 @@ fn default_poll_interval_ms() -> u64 {
     2000
 }
 
+fn min_poll_ms(realtime_mode: bool) -> u64 {
+    if realtime_mode { 50 } else { 500 }
+}
+
+fn normalize_poll_ms(poll_ms: u64, realtime_mode: bool) -> u64 {
+    poll_ms.max(min_poll_ms(realtime_mode))
+}
+
 pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
     match args.command {
         CopyCommand::Configure(cfg) => {
@@ -159,12 +171,14 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
                 max_total_exposure_pct: cfg.max_total_exposure_pct,
                 min_copy_usd: cfg.min_copy_usd,
                 poll_interval_secs: cfg.poll_interval_secs,
-                poll_interval_ms: cfg
-                    .poll_interval_ms
-                    .unwrap_or(cfg.poll_interval_secs.saturating_mul(1000))
-                    .max(500),
+                poll_interval_ms: normalize_poll_ms(
+                    cfg.poll_interval_ms
+                        .unwrap_or(cfg.poll_interval_secs.saturating_mul(1000)),
+                    cfg.realtime_mode,
+                ),
                 risk_level: cfg.risk_level,
                 execute_orders: cfg.execute_orders,
+                realtime_mode: cfg.realtime_mode,
             };
             save_config(&c)?;
             init_db()?;
@@ -301,7 +315,7 @@ async fn run_ui(ui: UiArgs) -> Result<()> {
             monitoring: false,
             current_poll_interval_ms: load_config()
                 .ok()
-                .map(|c| c.poll_interval_ms.max(500))
+                .map(|c| normalize_poll_ms(c.poll_interval_ms, c.realtime_mode))
                 .unwrap_or(default_poll_interval_ms()),
             warning: None,
             last_seen_hashes: HashSet::new(),
@@ -375,12 +389,14 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
                 max_total_exposure_pct: cfg.max_total_exposure_pct,
                 min_copy_usd: cfg.min_copy_usd,
                 poll_interval_secs: cfg.poll_interval_secs,
-                poll_interval_ms: cfg
-                    .poll_interval_ms
-                    .unwrap_or(cfg.poll_interval_secs.saturating_mul(1000))
-                    .max(500),
+                poll_interval_ms: normalize_poll_ms(
+                    cfg.poll_interval_ms
+                        .unwrap_or(cfg.poll_interval_secs.saturating_mul(1000)),
+                    cfg.realtime_mode,
+                ),
                 risk_level: cfg.risk_level,
                 execute_orders: cfg.execute_orders,
+                realtime_mode: cfg.realtime_mode,
             };
             save_config(&config)?;
             let mut runtime = app.runtime.lock().await;
@@ -426,7 +442,14 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             (
                 runtime.monitoring,
                 runtime.config.clone(),
-                runtime.current_poll_interval_ms.max(500),
+                normalize_poll_ms(
+                    runtime.current_poll_interval_ms,
+                    runtime
+                        .config
+                        .as_ref()
+                        .map(|c| c.realtime_mode)
+                        .unwrap_or(false),
+                ),
             )
         };
         if !running {
@@ -613,6 +636,11 @@ fn validate_config(cfg: &ConfigureArgs) -> Result<()> {
     }
     if cfg.min_copy_usd < Decimal::ZERO {
         bail!("min-copy-usd cannot be negative");
+    }
+    if let Some(ms) = cfg.poll_interval_ms
+        && ms < min_poll_ms(cfg.realtime_mode)
+    {
+        bail!("poll-interval-ms too low for selected mode");
     }
     Ok(())
 }
@@ -880,6 +908,7 @@ mod tests {
             poll_interval_ms: 2000,
             risk_level: RiskLevel::Balanced,
             execute_orders: false,
+            realtime_mode: false,
         };
         let state = CopyState::default();
         let p = compute_plan(&cfg, &state, d("1000"), d("200")).unwrap();
@@ -899,6 +928,7 @@ mod tests {
             poll_interval_ms: 2000,
             risk_level: RiskLevel::Balanced,
             execute_orders: false,
+            realtime_mode: false,
         };
         let state = CopyState {
             movements: vec![MovementRecord {
