@@ -58,6 +58,9 @@ pub struct ConfigureArgs {
     pub min_copy_usd: Decimal,
     #[arg(long, default_value_t = 2)]
     pub poll_interval_secs: u64,
+    /// Optional polling interval in milliseconds (min 500ms). Overrides poll-interval-secs when set.
+    #[arg(long)]
+    pub poll_interval_ms: Option<u64>,
     #[arg(long, value_enum, default_value_t = RiskLevel::Balanced)]
     pub risk_level: RiskLevel,
     #[arg(long, default_value_t = false)]
@@ -110,6 +113,8 @@ pub struct CopyConfig {
     pub max_total_exposure_pct: Decimal,
     pub min_copy_usd: Decimal,
     pub poll_interval_secs: u64,
+    #[serde(default = "default_poll_interval_ms")]
+    pub poll_interval_ms: u64,
     pub risk_level: RiskLevel,
     pub execute_orders: bool,
 }
@@ -139,6 +144,10 @@ pub struct PlanResult {
     pub reason: String,
 }
 
+fn default_poll_interval_ms() -> u64 {
+    2000
+}
+
 pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
     match args.command {
         CopyCommand::Configure(cfg) => {
@@ -150,6 +159,10 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
                 max_total_exposure_pct: cfg.max_total_exposure_pct,
                 min_copy_usd: cfg.min_copy_usd,
                 poll_interval_secs: cfg.poll_interval_secs,
+                poll_interval_ms: cfg
+                    .poll_interval_ms
+                    .unwrap_or(cfg.poll_interval_secs.saturating_mul(1000))
+                    .max(500),
                 risk_level: cfg.risk_level,
                 execute_orders: cfg.execute_orders,
             };
@@ -235,6 +248,8 @@ struct UiAppState {
 struct RuntimeState {
     config: Option<CopyConfig>,
     monitoring: bool,
+    current_poll_interval_ms: u64,
+    warning: Option<String>,
     last_seen_hashes: HashSet<String>,
 }
 
@@ -243,6 +258,8 @@ struct UiStateResponse {
     configured: bool,
     monitoring: bool,
     config: Option<CopyConfig>,
+    current_poll_interval_ms: u64,
+    warning: Option<String>,
     movement_count: usize,
     daily_pnl: Vec<(String, Decimal)>,
     historical_pnl: Vec<(String, Decimal)>,
@@ -282,6 +299,11 @@ async fn run_ui(ui: UiArgs) -> Result<()> {
         runtime: Arc::new(Mutex::new(RuntimeState {
             config: load_config().ok(),
             monitoring: false,
+            current_poll_interval_ms: load_config()
+                .ok()
+                .map(|c| c.poll_interval_ms.max(500))
+                .unwrap_or(default_poll_interval_ms()),
+            warning: None,
             last_seen_hashes: HashSet::new(),
         })),
     };
@@ -326,6 +348,8 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
                 configured: runtime.config.is_some(),
                 monitoring: runtime.monitoring,
                 config: runtime.config.clone(),
+                current_poll_interval_ms: runtime.current_poll_interval_ms,
+                warning: runtime.warning.clone(),
                 movement_count: db_state.movements.len(),
                 daily_pnl: daily_pnl_series(&db_state.movements),
                 historical_pnl: cumulative_pnl_series(&db_state.movements),
@@ -351,6 +375,10 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
                 max_total_exposure_pct: cfg.max_total_exposure_pct,
                 min_copy_usd: cfg.min_copy_usd,
                 poll_interval_secs: cfg.poll_interval_secs,
+                poll_interval_ms: cfg
+                    .poll_interval_ms
+                    .unwrap_or(cfg.poll_interval_secs.saturating_mul(1000))
+                    .max(500),
                 risk_level: cfg.risk_level,
                 execute_orders: cfg.execute_orders,
             };
@@ -393,9 +421,13 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
 async fn monitor_loop(app: UiAppState) -> Result<()> {
     let data_client = polymarket_client_sdk::data::Client::default();
     loop {
-        let (running, cfg) = {
+        let (running, cfg, poll_ms) = {
             let runtime = app.runtime.lock().await;
-            (runtime.monitoring, runtime.config.clone())
+            (
+                runtime.monitoring,
+                runtime.config.clone(),
+                runtime.current_poll_interval_ms.max(500),
+            )
         };
         if !running {
             break;
@@ -414,7 +446,30 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             .unwrap_or(Decimal::ONE);
 
         let trades_req = TradesRequest::builder().user(leader).limit(20)?.build();
-        let trades = data_client.trades(&trades_req).await.unwrap_or_default();
+        let trades = match data_client.trades(&trades_req).await {
+            Ok(trades) => {
+                let mut runtime = app.runtime.lock().await;
+                runtime.warning = None;
+                trades
+            }
+            Err(e) => {
+                let mut runtime = app.runtime.lock().await;
+                let msg = e.to_string();
+                if is_rate_limit_error(&msg) {
+                    runtime.current_poll_interval_ms = runtime
+                        .current_poll_interval_ms
+                        .saturating_add(250)
+                        .max(500);
+                    runtime.warning = Some(format!(
+                        "Rate limit detectado. Aumentando polling a {} ms",
+                        runtime.current_poll_interval_ms
+                    ));
+                } else {
+                    runtime.warning = Some(format!("Error consultando trades: {msg}"));
+                }
+                Vec::new()
+            }
+        };
 
         for t in trades {
             let tx_hash = t.transaction_hash.to_string();
@@ -446,12 +501,14 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             append_db_movement(&record)?;
         }
 
-        tokio::time::sleep(Duration::from_millis(
-            (cfg.poll_interval_secs.max(1)) * 1000,
-        ))
-        .await;
+        tokio::time::sleep(Duration::from_millis(poll_ms)).await;
     }
     Ok(())
+}
+
+fn is_rate_limit_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("429") || m.contains("too many") || m.contains("rate limit")
 }
 
 fn is_authorized(
@@ -820,6 +877,7 @@ mod tests {
             max_total_exposure_pct: d("100"),
             min_copy_usd: d("1"),
             poll_interval_secs: 2,
+            poll_interval_ms: 2000,
             risk_level: RiskLevel::Balanced,
             execute_orders: false,
         };
@@ -838,6 +896,7 @@ mod tests {
             max_total_exposure_pct: d("60"),
             min_copy_usd: d("1"),
             poll_interval_secs: 2,
+            poll_interval_ms: 2000,
             risk_level: RiskLevel::Balanced,
             execute_orders: false,
         };

@@ -439,6 +439,8 @@ polymarket copy ui --host 127.0.0.1 --port 8787
 
 La UI guarda histórico en una base de datos local JSONL en `~/.config/polymarket/copy_trader_db.jsonl` y usa endpoint incremental de actualizaciones para minimizar latencia de render.
 
+Desde la UI puedes bajar el polling hasta **500ms**. Si la API devuelve errores de exceso de consultas (rate limit/429), la UI mostrará aviso y el bot subirá automáticamente el intervalo en bloques de **250ms**.
+
 ### Other
 
 ```bash
