@@ -71,6 +71,9 @@ set "PATH=%PATH%;%BIN_DIR%"
 setx PATH "%PATH%" >nul 2>nul
 
 :run_launch
+echo [INFO] Abriendo consola interactiva de Polymarket (shell)...
+start "Polymarket CLI" cmd /k ""%CLI_CMD%" shell"
+
 echo [INFO] Ejecutando: "%CLI_CMD%" copy ui --host %HOST% --port %PORT%
 echo.
 "%CLI_CMD%" copy ui --host %HOST% --port %PORT%
