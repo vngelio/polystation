@@ -434,6 +434,10 @@ td.ts  { color: var(--text-dim); font-size: 11px; }
       <span class="val" id="topPoll">—</span>
       <span>ms</span>
     </div>
+    <div class="stat-pill">
+      <span>DISPONIBLE</span>
+      <span class="val online" id="topAvailable">$0.00</span>
+    </div>
   </div>
   <div class="topbar-clock">
     <span class="clock-time" id="clockTime">00:00:00</span>
@@ -561,6 +565,29 @@ td.ts  { color: var(--text-dim); font-size: 11px; }
       <span class="status-cell-label">Alerta</span>
       <span class="status-cell-val" id="warnVal" style="font-size:14px;color:var(--text-dim);">—</span>
       <span class="status-cell-hint" id="warnHint">sin alertas</span>
+    </div>
+  </div>
+
+  <div class="status-row">
+    <div class="status-cell">
+      <span class="status-cell-label">Fondos iniciales</span>
+      <span class="status-cell-val c" id="fundsInitial">$0.00</span>
+      <span class="status-cell-hint">capital configurado</span>
+    </div>
+    <div class="status-cell">
+      <span class="status-cell-label">Exposición abierta</span>
+      <span class="status-cell-val a" id="fundsUsed">$0.00</span>
+      <span class="status-cell-hint">en operaciones sin settle</span>
+    </div>
+    <div class="status-cell">
+      <span class="status-cell-label">Fondos disponibles</span>
+      <span class="status-cell-val g" id="fundsAvailable">$0.00</span>
+      <span class="status-cell-hint">lo que queda para copiar</span>
+    </div>
+    <div class="status-cell">
+      <span class="status-cell-label">Equity actual</span>
+      <span class="status-cell-val" id="fundsEquity">$0.00</span>
+      <span class="status-cell-hint" id="fundsPnlHint">PnL neto: $0.00</span>
     </div>
   </div>
 
@@ -765,6 +792,16 @@ document.getElementById('buildStamp').textContent = 'BUILD ' + Date.now().toStri
 // ── STATE ──────────────────────────────────────
 let latest = 0, mode = 'real', localModeDirty = false, moveCount = 0;
 
+const toNum = (v) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+};
+
+const fmtUsd = (v) => {
+  const n = toNum(v);
+  return `$${n.toFixed(2)}`;
+};
+
 function auth(){
   const t = document.getElementById('token').value.trim();
   if(!t) throw new Error('TOKEN REQUERIDO');
@@ -936,6 +973,23 @@ async function fullRefresh(){
     document.getElementById('pollDisplay').textContent=pm||'—';
     document.getElementById('topPoll').textContent=pm||'—';
     document.getElementById('pollMs').value=pm||2000;
+
+    const initialFunds = toNum(s.initial_allocated_funds);
+    const currentEquity = toNum(s.current_equity);
+    const usedExposure = toNum(s.used_exposure);
+    const availableToCopy = toNum(s.available_to_copy);
+    const netPnl = currentEquity - initialFunds;
+
+    document.getElementById('fundsInitial').textContent = fmtUsd(initialFunds);
+    document.getElementById('fundsUsed').textContent = fmtUsd(usedExposure);
+    document.getElementById('fundsAvailable').textContent = fmtUsd(availableToCopy);
+    document.getElementById('fundsEquity').textContent = fmtUsd(currentEquity);
+    document.getElementById('fundsEquity').className = 'status-cell-val ' + (netPnl >= 0 ? 'g' : 'r');
+    document.getElementById('fundsPnlHint').textContent = `PnL neto: ${netPnl >= 0 ? '+' : ''}${fmtUsd(netPnl)}`;
+
+    document.getElementById('topAvailable').textContent = fmtUsd(availableToCopy);
+    document.getElementById('topAvailable').className = 'val ' + (availableToCopy > 0 ? 'online' : 'offline');
+
     if(s.warning){
       document.getElementById('warnVal').textContent='⚠ ALERTA'; document.getElementById('warnVal').style.color='var(--red)';
       document.getElementById('warnHint').textContent=s.warning.substring(0,40); document.getElementById('warnHint').style.color='var(--red)';

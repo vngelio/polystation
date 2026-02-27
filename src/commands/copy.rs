@@ -288,6 +288,10 @@ struct UiStateResponse {
     warning: Option<String>,
     active_mode: String,
     movement_count: usize,
+    initial_allocated_funds: Decimal,
+    current_equity: Decimal,
+    used_exposure: Decimal,
+    available_to_copy: Decimal,
     daily_pnl: Vec<(String, Decimal)>,
     historical_pnl: Vec<(String, Decimal)>,
 }
@@ -373,6 +377,26 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
             let runtime = app.runtime.lock().await;
             let mode = current_mode_from_runtime(&runtime);
             let db_state = load_state_from_db(mode)?;
+            let initial_allocated_funds = runtime
+                .config
+                .as_ref()
+                .map(|c| c.allocated_funds)
+                .unwrap_or(Decimal::ZERO);
+            let settled_pnl: Decimal = db_state
+                .movements
+                .iter()
+                .filter(|m| m.settled)
+                .map(|m| m.pnl)
+                .sum();
+            let used_exposure: Decimal = db_state
+                .movements
+                .iter()
+                .filter(|m| !m.settled)
+                .map(|m| m.copied_value)
+                .sum();
+            let current_equity = initial_allocated_funds + settled_pnl;
+            let available_to_copy = (current_equity - used_exposure).max(Decimal::ZERO);
+
             let payload = serde_json::to_string(&UiStateResponse {
                 configured: runtime.config.is_some(),
                 monitoring: runtime.monitoring,
@@ -392,6 +416,10 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
                     .unwrap_or("real")
                     .to_string(),
                 movement_count: db_state.movements.len(),
+                initial_allocated_funds,
+                current_equity,
+                used_exposure,
+                available_to_copy,
                 daily_pnl: daily_pnl_series(&db_state.movements),
                 historical_pnl: cumulative_pnl_series(&db_state.movements),
             })?;
