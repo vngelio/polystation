@@ -458,6 +458,7 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
             };
             save_config(&config)?;
             let mut runtime = app.runtime.lock().await;
+            runtime.current_poll_interval_ms = config.poll_interval_ms;
             runtime.config = Some(config);
             write_response(&mut stream, "200 OK", "application/json", "{\"ok\":true}")?;
         }
