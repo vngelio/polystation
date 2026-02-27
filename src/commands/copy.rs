@@ -574,8 +574,13 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             .user(settlement_user)
             .limit(200)?
             .build();
-        let closed_positions = match data_client.closed_positions(&closed_req).await {
-            Ok(positions) => {
+        let closed_positions = match tokio::time::timeout(
+            Duration::from_secs(15),
+            data_client.closed_positions(&closed_req),
+        )
+        .await
+        {
+            Ok(Ok(positions)) => {
                 log_copy_event(
                     "real",
                     format!(
@@ -585,10 +590,16 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 );
                 positions
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let mut runtime = app.runtime.lock().await;
                 runtime.warning = Some(format!("Error consultando posiciones cerradas: {e}"));
                 log_copy_event("real", format!("error consultando cierres: {e}"));
+                Vec::new()
+            }
+            Err(_) => {
+                let mut runtime = app.runtime.lock().await;
+                runtime.warning = Some("Timeout consultando posiciones cerradas".to_string());
+                log_copy_event("real", "timeout consultando cierres (15s)");
                 Vec::new()
             }
         };
@@ -617,35 +628,44 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             format!("consultando ultimos movimientos de la cuenta a copiar ({leader})"),
         );
         let trades_req = TradesRequest::builder().user(leader).limit(20)?.build();
-        let trades = match data_client.trades(&trades_req).await {
-            Ok(trades) => {
-                log_copy_event(
-                    "real",
-                    format!("consulta trades completada: {} movimientos", trades.len()),
-                );
-                let mut runtime = app.runtime.lock().await;
-                runtime.warning = None;
-                trades
-            }
-            Err(e) => {
-                let mut runtime = app.runtime.lock().await;
-                let msg = e.to_string();
-                if is_rate_limit_error(&msg) {
-                    runtime.current_poll_interval_ms = runtime
-                        .current_poll_interval_ms
-                        .saturating_add(250)
-                        .max(500);
-                    runtime.warning = Some(format!(
-                        "Rate limit detectado. Aumentando polling a {} ms",
-                        runtime.current_poll_interval_ms
-                    ));
-                } else {
-                    runtime.warning = Some(format!("Error consultando trades: {msg}"));
+        let trades =
+            match tokio::time::timeout(Duration::from_secs(15), data_client.trades(&trades_req))
+                .await
+            {
+                Ok(Ok(trades)) => {
+                    log_copy_event(
+                        "real",
+                        format!("consulta trades completada: {} movimientos", trades.len()),
+                    );
+                    let mut runtime = app.runtime.lock().await;
+                    runtime.warning = None;
+                    trades
                 }
-                log_copy_event("real", format!("error consultando trades recientes: {msg}"));
-                Vec::new()
-            }
-        };
+                Ok(Err(e)) => {
+                    let mut runtime = app.runtime.lock().await;
+                    let msg = e.to_string();
+                    if is_rate_limit_error(&msg) {
+                        runtime.current_poll_interval_ms = runtime
+                            .current_poll_interval_ms
+                            .saturating_add(250)
+                            .max(500);
+                        runtime.warning = Some(format!(
+                            "Rate limit detectado. Aumentando polling a {} ms",
+                            runtime.current_poll_interval_ms
+                        ));
+                    } else {
+                        runtime.warning = Some(format!("Error consultando trades: {msg}"));
+                    }
+                    log_copy_event("real", format!("error consultando trades recientes: {msg}"));
+                    Vec::new()
+                }
+                Err(_) => {
+                    let mut runtime = app.runtime.lock().await;
+                    runtime.warning = Some("Timeout consultando trades recientes".to_string());
+                    log_copy_event("real", "timeout consultando ultimos movimientos (15s)");
+                    Vec::new()
+                }
+            };
 
         for t in trades {
             let tx_hash = t.transaction_hash.to_string();
@@ -813,8 +833,13 @@ async fn simulation_step(
         .user(leader)
         .limit(200)?
         .build();
-    let closed_positions = match data_client.closed_positions(&closed_req).await {
-        Ok(positions) => {
+    let closed_positions = match tokio::time::timeout(
+        Duration::from_secs(15),
+        data_client.closed_positions(&closed_req),
+    )
+    .await
+    {
+        Ok(Ok(positions)) => {
             log_copy_event(
                 "sim",
                 format!(
@@ -824,10 +849,16 @@ async fn simulation_step(
             );
             positions
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let mut runtime = app.runtime.lock().await;
             runtime.warning = Some(format!("Error simulación consultando cerradas: {e}"));
             log_copy_event("sim", format!("error consultando cierres: {e}"));
+            Vec::new()
+        }
+        Err(_) => {
+            let mut runtime = app.runtime.lock().await;
+            runtime.warning = Some("Timeout simulación consultando cierres".to_string());
+            log_copy_event("sim", "timeout consultando cierres (15s)");
             Vec::new()
         }
     };
@@ -854,18 +885,29 @@ async fn simulation_step(
         format!("consultando ultimos movimientos de la cuenta a copiar ({leader})"),
     );
     let trades_req = TradesRequest::builder().user(leader).limit(20)?.build();
-    let trades = match data_client.trades(&trades_req).await {
-        Ok(trades) => {
+    let trades = match tokio::time::timeout(
+        Duration::from_secs(15),
+        data_client.trades(&trades_req),
+    )
+    .await
+    {
+        Ok(Ok(trades)) => {
             log_copy_event(
                 "sim",
                 format!("consulta trades completada: {} movimientos", trades.len()),
             );
             trades
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let mut runtime = app.runtime.lock().await;
             runtime.warning = Some(format!("Error simulación consultando trades: {e}"));
             log_copy_event("sim", format!("error consultando trades recientes: {e}"));
+            Vec::new()
+        }
+        Err(_) => {
+            let mut runtime = app.runtime.lock().await;
+            runtime.warning = Some("Timeout simulación consultando trades".to_string());
+            log_copy_event("sim", "timeout consultando ultimos movimientos (15s)");
             Vec::new()
         }
     };
