@@ -1,46 +1,90 @@
 <!doctype html>
 <html><head><meta charset="utf-8"/><title>Polymarket Copy UI</title>
 <style>
-body{font-family:system-ui,Arial;margin:20px} input{margin:4px} table{border-collapse:collapse;width:100%} td,th{border:1px solid #ddd;padding:6px;font-size:13px}
-.row{display:flex;gap:10px;flex-wrap:wrap} .ok{color:#0a7f2e}.bad{color:#b20000}
+body{font-family:system-ui,Arial;margin:20px;max-width:1200px}
+input{margin:4px}
+table{border-collapse:collapse;width:100%} td,th{border:1px solid #ddd;padding:6px;font-size:13px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.ok{color:#0a7f2e}.bad{color:#b20000}
 .tabs button{padding:8px 12px;margin-right:8px}.active{background:#0b57d0;color:#fff}
+.field{display:flex;flex-direction:column;min-width:190px}
+.field label{font-size:12px;color:#444;margin-left:4px}
+.field input{margin-top:2px}
+.help{background:#f5f8ff;border:1px solid #d8e3ff;border-radius:8px;padding:10px;margin:10px 0;font-size:13px}
+.small{font-size:12px;color:#666}
+.chart{width:100%;height:240px;border:1px solid #ddd;border-radius:8px;background:#fff}
+.chart-wrap{margin-bottom:12px}
+.hidden{display:none !important}
 </style>
 </head><body>
 <h2>Copy Trading UI</h2>
 <p>Pega aquí el token que el CLI imprime al iniciar <code>copy ui</code>:</p>
 <input id="token" placeholder="UI API token" size="70"/>
 <div class="tabs">
-  <button id="tabReal" class="active" onclick="setMode('real')">Modo real</button>
-  <button id="tabSim" onclick="setMode('simulacion')">Modo simulación</button>
+  <button id="tabReal" class="active" onclick="setMode('real','user')">Modo real</button>
+  <button id="tabSim" onclick="setMode('simulacion','user')">Modo simulación</button>
+</div>
+<p id="modeHint" class="small"></p>
+
+<div class="help">
+  <b>Qué significa cada campo</b>
+  <ul>
+    <li><b>Cuenta líder</b>: wallet que vas a seguir.</li>
+    <li><b>Fondos asignados</b>: capital máximo para esta estrategia.</li>
+    <li><b>Máx por movimiento (%)</b>: tope por operación copiada.</li>
+    <li><b>Máx exposición total (%)</b>: límite de capital abierto simultáneamente.</li>
+    <li><b>Mínimo copia (USD)</b>: operaciones menores no se copian.</li>
+    <li><b>Poll (ms)</b>: frecuencia de consulta.</li>
+    <li><b>Execute orders</b>: solo en modo real, ejecuta órdenes reales en tu wallet.</li>
+  </ul>
+</div>
+
+<div class="row">
+  <div class="field"><label for="leader">Cuenta líder (0x...)</label><input id="leader" value="" size="44"/></div>
+  <div class="field"><label for="funds">Fondos asignados (USD)</label><input id="funds" type="number" min="1" step="1" value="1000"/></div>
+  <div class="field"><label for="maxTrade">Máx por movimiento (%)</label><input id="maxTrade" type="number" min="0.01" max="100" step="0.1" value="5"/></div>
+  <div class="field"><label for="maxExposure">Máx exposición total (%)</label><input id="maxExposure" type="number" min="0.01" max="100" step="0.1" value="70"/></div>
+  <div class="field"><label for="minCopy">Mínimo copia (USD)</label><input id="minCopy" type="number" min="0" step="0.1" value="1"/></div>
+  <div class="field"><label for="pollMs">Poll interval (ms)</label><input id="pollMs" type="number" min="500" step="250" value="2000"/></div>
+</div>
+
+<div class="row" id="realOnlyControls">
+  <label><input type="checkbox" id="realtimeMode" onchange="toggleRealtime()"/> Modo tiempo real</label>
+  <label><input type="checkbox" id="execute"/> Execute orders (experimental)</label>
 </div>
 <div class="row">
-<input id="leader" placeholder="Cuenta a copiar 0x..." size="44"/>
-<input id="funds" placeholder="Fondos iniciales" value="1000"/>
-<input id="maxTrade" placeholder="Max trade %" value="5"/>
-<input id="maxExposure" placeholder="Max exposure %" value="70"/>
-<input id="minCopy" placeholder="Min copy USD" value="1"/>
-<label><input type="checkbox" id="realtimeMode" onchange="toggleRealtime()"/> Modo tiempo real (solo real)</label>
-<input id="pollMs" type="number" min="500" step="250" placeholder="Poll ms" value="2000"/>
-<label><input type="checkbox" id="execute"/> Execute orders (experimental)</label>
-<button onclick="configure()">Guardar config</button>
-<button onclick="startCopy()">Start</button>
-<button onclick="stopCopy()">Stop</button>
+  <button onclick="configure()">Guardar config</button>
+  <button onclick="startCopy()">Start</button>
+  <button onclick="stopCopy()">Stop</button>
 </div>
+<p id="simOnlyHint" class="small hidden">En simulación, los controles exclusivos de modo real se ocultan automáticamente.</p>
+
 <p id="status"></p>
+<div class="chart-wrap"><h3>Beneficio diario</h3><canvas id="dailyChart" class="chart" width="1100" height="240"></canvas></div>
+<div class="chart-wrap"><h3>Beneficio histórico (acumulado)</h3><canvas id="historicalChart" class="chart" width="1100" height="240"></canvas></div>
 <h3>Movimientos</h3>
 <table><thead><tr><th>Hora</th><th>Mercado</th><th>Leader $</th><th>Copiado $</th><th>Settled</th><th>PnL</th></tr></thead><tbody id="moves"></tbody></table>
-<h3>Beneficio diario</h3><pre id="daily"></pre>
-<h3>Beneficio histórico (acumulado)</h3><pre id="historical"></pre>
 <script>
 let latest=0;
 let mode='real';
+let localModeDirty=false;
 function auth(){const t=token.value.trim(); if(!t) throw new Error('Falta token'); return t;}
-function setMode(m){
+function setMode(m,source='server'){
   mode=m;
+  if(source==='user'){localModeDirty=true;}
   tabReal.classList.toggle('active', m==='real');
   tabSim.classList.toggle('active', m==='simulacion');
-  if(m==='simulacion'){realtimeMode.checked=false; realtimeMode.disabled=true; pollMs.min=500; if(Number(pollMs.value)<500) pollMs.value=2000;}
-  else{realtimeMode.disabled=false; toggleRealtime();}
+  if(m==='simulacion'){
+    realtimeMode.checked=false; execute.checked=false;
+    realOnlyControls.classList.add('hidden');
+    simOnlyHint.classList.remove('hidden');
+    pollMs.min=500; if(Number(pollMs.value)<500) pollMs.value=2000;
+  } else {
+    realOnlyControls.classList.remove('hidden');
+    simOnlyHint.classList.add('hidden');
+    toggleRealtime();
+  }
+  modeHint.textContent = localModeDirty ? 'Modo cambiado localmente. Pulsa "Guardar config" para aplicarlo.' : '';
 }
 function toggleRealtime(){
   if(mode!=='real'){ pollMs.min=500; pollMs.step=250; return; }
@@ -58,27 +102,79 @@ async function configure(){
  const payload={
   leader:leader.value,allocated_funds:funds.value,max_trade_pct:maxTrade.value,max_total_exposure_pct:maxExposure.value,min_copy_usd:minCopy.value,
   poll_interval_secs:Math.max(1,Math.round(Number(pollMs.value)/1000)),poll_interval_ms:Math.max(minMs,Number(pollMs.value)||2000),
-  risk_level:'balanced',execute_orders:execute.checked,realtime_mode:rt,simulation_mode:(mode==='simulacion')
+  risk_level:'balanced',execute_orders:(mode==='real' && execute.checked),realtime_mode:rt,simulation_mode:(mode==='simulacion')
  };
- await api('/api/configure',{method:'POST',body:JSON.stringify(payload)}); await fullRefresh();
+ await api('/api/configure',{method:'POST',body:JSON.stringify(payload)});
+ localModeDirty=false;
+ await fullRefresh();
 }
 async function startCopy(){await api('/api/start',{method:'POST'}); await fullRefresh();}
 async function stopCopy(){await api('/api/stop',{method:'POST'}); await fullRefresh();}
-function bars(v){const n=Math.min(40,Math.abs(Math.trunc(Number(v)))); return v<0?'-'.repeat(n)+'|':'|'+ '+'.repeat(n)}
 function prependMove(m){const tr=document.createElement('tr'); tr.innerHTML=`<td>${m.timestamp}</td><td>${m.market}</td><td>${m.leader_value}</td><td>${m.copied_value}</td><td>${m.settled}</td><td>${m.pnl}</td>`; moves.prepend(tr); while(moves.children.length>300){moves.removeChild(moves.lastChild)}}
+
+function drawSeriesChart(canvasId, series, color){
+  const canvas=document.getElementById(canvasId);
+  if(!canvas) return;
+  const ctx=canvas.getContext('2d');
+  const parentWidth = Math.max(500, canvas.parentElement.clientWidth - 10);
+  canvas.width = parentWidth;
+  const w=canvas.width, h=canvas.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle='#fff'; ctx.fillRect(0,0,w,h);
+  const pad={l:46,r:16,t:14,b:26};
+  const vals=(series||[]).map(d=>Number(d[1])).filter(v=>Number.isFinite(v));
+  if(vals.length===0){
+    ctx.fillStyle='#666'; ctx.font='13px Arial'; ctx.fillText('Sin datos aún', pad.l, h/2);
+    return;
+  }
+  let min=Math.min(...vals), max=Math.max(...vals);
+  if(min===max){ min-=1; max+=1; }
+  const toX=i=> pad.l + (i*(w-pad.l-pad.r))/Math.max(1,vals.length-1);
+  const toY=v=> h-pad.b - ((v-min)*(h-pad.t-pad.b))/(max-min);
+
+  // axes
+  ctx.strokeStyle='#d9d9d9'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(pad.l,pad.t); ctx.lineTo(pad.l,h-pad.b); ctx.lineTo(w-pad.r,h-pad.b); ctx.stroke();
+
+  // zero line
+  if(min<0 && max>0){
+    const y0=toY(0); ctx.strokeStyle='#efefef'; ctx.beginPath(); ctx.moveTo(pad.l,y0); ctx.lineTo(w-pad.r,y0); ctx.stroke();
+  }
+
+  // line
+  ctx.strokeStyle=color; ctx.lineWidth=2;
+  ctx.beginPath(); vals.forEach((v,i)=>{ const x=toX(i), y=toY(v); if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);}); ctx.stroke();
+
+  // points
+  ctx.fillStyle=color; vals.forEach((v,i)=>{const x=toX(i),y=toY(v); ctx.beginPath(); ctx.arc(x,y,2.5,0,Math.PI*2); ctx.fill();});
+
+  // y labels
+  ctx.fillStyle='#666'; ctx.font='11px Arial';
+  ctx.fillText(max.toFixed(2), 6, pad.t+4);
+  ctx.fillText(min.toFixed(2), 6, h-pad.b+4);
+  const last=vals[vals.length-1];
+  ctx.fillStyle= last>=0 ? '#0a7f2e' : '#b20000';
+  ctx.fillText(`Último: ${last.toFixed(2)}`, w-120, pad.t+4);
+}
 async function pollUpdates(){try{const u=await api(`/api/updates?since=${latest}`); latest=u.latest_id||latest; (u.movements||[]).forEach(prependMove);}catch(e){status.textContent='Error updates: '+e.message; status.className='bad'}}
 async function fullRefresh(){
  try{
    const s=await api('/api/state');
-   setMode(s.active_mode==='simulacion'?'simulacion':'real');
+   const backendMode = s.active_mode==='simulacion'?'simulacion':'real';
+   if(!localModeDirty){ setMode(backendMode,'server'); }
    status.textContent=`Modo: ${s.active_mode} | Monitoring: ${s.monitoring} | Poll: ${s.current_poll_interval_ms}ms | Movimientos: ${s.movement_count}`;
    status.className=s.warning?'bad':'ok'; if(s.warning){status.textContent += ` | Aviso: ${s.warning}`;}
-   if(s.config){leader.value=s.config.leader; funds.value=s.config.allocated_funds; maxTrade.value=s.config.max_trade_pct; maxExposure.value=s.config.max_total_exposure_pct; minCopy.value=s.config.min_copy_usd; execute.checked=!!s.config.execute_orders; realtimeMode.checked=!!s.config.realtime_mode;}
+   if(s.config){
+     leader.value=s.config.leader; funds.value=s.config.allocated_funds; maxTrade.value=s.config.max_trade_pct; maxExposure.value=s.config.max_total_exposure_pct; minCopy.value=s.config.min_copy_usd;
+     if(!localModeDirty){ execute.checked=!!s.config.execute_orders; realtimeMode.checked=!!s.config.realtime_mode; }
+   }
    pollMs.value=s.current_poll_interval_ms || 2000; toggleRealtime();
-   daily.textContent=(s.daily_pnl||[]).map(d=>`${d[0]} ${bars(Number(d[1]))} ${d[1]}`).join('\n');
-   historical.textContent=(s.historical_pnl||[]).map(d=>`${d[0]} ${bars(Number(d[1]))} ${d[1]}`).join('\n');
+   drawSeriesChart('dailyChart', s.daily_pnl||[], '#0b57d0');
+   drawSeriesChart('historicalChart', s.historical_pnl||[], '#7d3cff');
  }catch(e){status.textContent='Error: '+e.message; status.className='bad'}
 }
-setInterval(pollUpdates,500); setInterval(fullRefresh,4000); toggleRealtime();
+setInterval(pollUpdates,500); setInterval(fullRefresh,4000);
+window.addEventListener('resize', ()=>{ fullRefresh(); });
+toggleRealtime();
 </script>
 </body></html>
