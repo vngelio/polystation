@@ -458,6 +458,7 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
             };
             save_config(&config)?;
             let mut runtime = app.runtime.lock().await;
+            runtime.current_poll_interval_ms = config.poll_interval_ms;
             runtime.config = Some(config);
             write_response(&mut stream, "200 OK", "application/json", "{\"ok\":true}")?;
         }
@@ -565,15 +566,29 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             leader
         };
 
+        log_copy_event(
+            "real",
+            format!("consultando cierres/resoluciones de la cuenta a copiar ({settlement_user})"),
+        );
         let closed_req = ClosedPositionsRequest::builder()
             .user(settlement_user)
             .limit(200)?
             .build();
         let closed_positions = match data_client.closed_positions(&closed_req).await {
-            Ok(positions) => positions,
+            Ok(positions) => {
+                log_copy_event(
+                    "real",
+                    format!(
+                        "consulta de cierres completada: {} posiciones",
+                        positions.len()
+                    ),
+                );
+                positions
+            }
             Err(e) => {
                 let mut runtime = app.runtime.lock().await;
                 runtime.warning = Some(format!("Error consultando posiciones cerradas: {e}"));
+                log_copy_event("real", format!("error consultando cierres: {e}"));
                 Vec::new()
             }
         };
@@ -599,7 +614,7 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
 
         log_copy_event(
             "real",
-            "consultando ultimos movimientos del leader (trades recientes)",
+            format!("consultando ultimos movimientos de la cuenta a copiar ({leader})"),
         );
         let trades_req = TradesRequest::builder().user(leader).limit(20)?.build();
         let trades = match data_client.trades(&trades_req).await {
@@ -790,15 +805,29 @@ async fn simulation_step(
         .and_then(|v| v.first().map(|x| x.value))
         .unwrap_or(Decimal::ONE);
 
+    log_copy_event(
+        "sim",
+        format!("consultando cierres/resoluciones de la cuenta a copiar ({leader})"),
+    );
     let closed_req = ClosedPositionsRequest::builder()
         .user(leader)
         .limit(200)?
         .build();
     let closed_positions = match data_client.closed_positions(&closed_req).await {
-        Ok(positions) => positions,
+        Ok(positions) => {
+            log_copy_event(
+                "sim",
+                format!(
+                    "consulta de cierres completada: {} posiciones",
+                    positions.len()
+                ),
+            );
+            positions
+        }
         Err(e) => {
             let mut runtime = app.runtime.lock().await;
             runtime.warning = Some(format!("Error simulación consultando cerradas: {e}"));
+            log_copy_event("sim", format!("error consultando cierres: {e}"));
             Vec::new()
         }
     };
@@ -822,7 +851,7 @@ async fn simulation_step(
 
     log_copy_event(
         "sim",
-        "consultando ultimos movimientos del leader (trades recientes)",
+        format!("consultando ultimos movimientos de la cuenta a copiar ({leader})"),
     );
     let trades_req = TradesRequest::builder().user(leader).limit(20)?.build();
     let trades = match data_client.trades(&trades_req).await {
