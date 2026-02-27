@@ -597,9 +597,17 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             }
         }
 
+        log_copy_event(
+            "real",
+            "consultando ultimos movimientos del leader (trades recientes)",
+        );
         let trades_req = TradesRequest::builder().user(leader).limit(20)?.build();
         let trades = match data_client.trades(&trades_req).await {
             Ok(trades) => {
+                log_copy_event(
+                    "real",
+                    format!("consulta trades completada: {} movimientos", trades.len()),
+                );
                 let mut runtime = app.runtime.lock().await;
                 runtime.warning = None;
                 trades
@@ -619,6 +627,7 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 } else {
                     runtime.warning = Some(format!("Error consultando trades: {msg}"));
                 }
+                log_copy_event("real", format!("error consultando trades recientes: {msg}"));
                 Vec::new()
             }
         };
@@ -661,6 +670,27 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                     plan.reason
                 ),
             );
+
+            match has_book_liquidity_for_simulation(&clob_client, &t, plan.capped_size).await {
+                Ok(true) => log_copy_event(
+                    "real",
+                    format!("liquidez disponible para copiar {} ({})", t.slug, tx_hash),
+                ),
+                Ok(false) => log_copy_event(
+                    "real",
+                    format!(
+                        "sin liquidez suficiente para copiar {} ({})",
+                        t.slug, tx_hash
+                    ),
+                ),
+                Err(e) => log_copy_event(
+                    "real",
+                    format!(
+                        "no se pudo validar liquidez para {} ({}): {}",
+                        t.slug, tx_hash, e
+                    ),
+                ),
+            }
 
             if cfg.execute_orders
                 && let Err(e) = execute_copy_order_from_trade(&t, plan.capped_size).await
@@ -790,12 +820,23 @@ async fn simulation_step(
         }
     }
 
+    log_copy_event(
+        "sim",
+        "consultando ultimos movimientos del leader (trades recientes)",
+    );
     let trades_req = TradesRequest::builder().user(leader).limit(20)?.build();
     let trades = match data_client.trades(&trades_req).await {
-        Ok(trades) => trades,
+        Ok(trades) => {
+            log_copy_event(
+                "sim",
+                format!("consulta trades completada: {} movimientos", trades.len()),
+            );
+            trades
+        }
         Err(e) => {
             let mut runtime = app.runtime.lock().await;
             runtime.warning = Some(format!("Error simulación consultando trades: {e}"));
+            log_copy_event("sim", format!("error consultando trades recientes: {e}"));
             Vec::new()
         }
     };
@@ -840,7 +881,18 @@ async fn simulation_step(
             ),
         );
 
-        if !has_book_liquidity_for_simulation(clob_client, &t, plan.capped_size).await? {
+        let has_liquidity =
+            has_book_liquidity_for_simulation(clob_client, &t, plan.capped_size).await?;
+        log_copy_event(
+            "sim",
+            format!(
+                "chequeo liquidez {} ({}): {}",
+                t.slug,
+                tx_hash,
+                if has_liquidity { "SI" } else { "NO" }
+            ),
+        );
+        if !has_liquidity {
             let mut runtime = app.runtime.lock().await;
             runtime.warning = Some(format!(
                 "Simulación: sin liquidez suficiente para {} ({})",
