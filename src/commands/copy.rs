@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -16,7 +16,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::output::OutputFormat;
-use polymarket_client_sdk::data::types::request::{TradesRequest, ValueRequest};
+use polymarket_client_sdk::auth::Signer as _;
+use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
+use polymarket_client_sdk::clob::types::{Amount, OrderType, Side as ClobSide};
+use polymarket_client_sdk::data::types::request::{
+    ClosedPositionsRequest, TradesRequest, ValueRequest,
+};
 
 #[derive(Args)]
 pub struct CopyArgs {
@@ -460,6 +465,7 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
 
 async fn monitor_loop(app: UiAppState) -> Result<()> {
     let data_client = polymarket_client_sdk::data::Client::default();
+    let clob_client = polymarket_client_sdk::clob::Client::default();
     loop {
         let (running, cfg, poll_ms) = {
             let runtime = app.runtime.lock().await;
@@ -484,7 +490,7 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
         };
 
         if cfg.simulation_mode {
-            simulation_step(&app, &cfg)?;
+            simulation_step(&app, &cfg, &data_client, &clob_client).await?;
             tokio::time::sleep(Duration::from_millis(poll_ms)).await;
             continue;
         }
@@ -497,6 +503,46 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             .ok()
             .and_then(|v| v.first().map(|x| x.value))
             .unwrap_or(Decimal::ONE);
+
+        let settlement_user = if cfg.execute_orders {
+            match crate::auth::resolve_signer(None) {
+                Ok(signer) => signer.address(),
+                Err(e) => {
+                    let mut runtime = app.runtime.lock().await;
+                    runtime.warning = Some(format!(
+                        "execute-orders activo pero no hay wallet configurada: {e}"
+                    ));
+                    leader
+                }
+            }
+        } else {
+            leader
+        };
+
+        let closed_req = ClosedPositionsRequest::builder()
+            .user(settlement_user)
+            .limit(200)?
+            .build();
+        let closed_positions = match data_client.closed_positions(&closed_req).await {
+            Ok(positions) => positions,
+            Err(e) => {
+                let mut runtime = app.runtime.lock().await;
+                runtime.warning = Some(format!("Error consultando posiciones cerradas: {e}"));
+                Vec::new()
+            }
+        };
+
+        if !closed_positions.is_empty() {
+            let mut state = load_state()?;
+            let settled =
+                settle_open_movements_from_closed_positions(&mut state, &closed_positions);
+            if !settled.is_empty() {
+                save_state(&state)?;
+                for movement in settled {
+                    settle_db_movement(StorageMode::Real, &movement.movement_id, movement.pnl)?;
+                }
+            }
+        }
 
         let trades_req = TradesRequest::builder().user(leader).limit(20)?.build();
         let trades = match data_client.trades(&trades_req).await {
@@ -526,15 +572,29 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
 
         for t in trades {
             let tx_hash = t.transaction_hash.to_string();
-            let mut runtime = app.runtime.lock().await;
-            if runtime.last_seen_hashes.contains(&tx_hash) {
-                continue;
+            {
+                let mut runtime = app.runtime.lock().await;
+                if runtime.last_seen_hashes.contains(&tx_hash) {
+                    continue;
+                }
+                runtime.last_seen_hashes.insert(tx_hash.clone());
             }
-            runtime.last_seen_hashes.insert(tx_hash.clone());
 
             let state = load_state()?;
+            if state.movements.iter().any(|m| m.movement_id == tx_hash) {
+                continue;
+            }
+
             let plan = compute_plan(&cfg, &state, leader_value, t.size * t.price)?;
             if plan.capped_size <= Decimal::ZERO {
+                continue;
+            }
+
+            if cfg.execute_orders
+                && let Err(e) = execute_copy_order_from_trade(&t, plan.capped_size).await
+            {
+                let mut runtime = app.runtime.lock().await;
+                runtime.warning = Some(format!("Error ejecutando orden en wallet: {e}"));
                 continue;
             }
 
@@ -559,60 +619,192 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
     Ok(())
 }
 
-fn simulation_step(app: &UiAppState, cfg: &CopyConfig) -> Result<()> {
-    let mut runtime = app.runtime.blocking_lock();
-    runtime.simulation_tick = runtime.simulation_tick.saturating_add(1);
+async fn execute_copy_order_from_trade(
+    trade: &polymarket_client_sdk::data::types::response::Trade,
+    copied_value_usd: Decimal,
+) -> Result<()> {
+    let signer = crate::auth::resolve_signer(None)?;
+    let client = crate::auth::authenticate_with_signer(&signer, None).await?;
 
-    let mut state = load_state()?;
-    let tick = runtime.simulation_tick;
-    let leader_movement = Decimal::from((tick % 7 + 1) as i64) * Decimal::from(5);
-    let plan = compute_plan(
-        cfg,
-        &state,
-        cfg.allocated_funds.max(Decimal::ONE),
-        leader_movement,
-    )?;
+    let side = if trade.side.to_string().eq_ignore_ascii_case("buy") {
+        ClobSide::Buy
+    } else {
+        ClobSide::Sell
+    };
 
-    if plan.capped_size > Decimal::ZERO {
-        let movement_id = format!("sim-{}", tick);
-        let market = format!("sim-market-{}", tick % 5);
+    let amount = if matches!(side, ClobSide::Sell) {
+        if trade.price <= Decimal::ZERO {
+            bail!("invalid leader trade price for sell copy: {}", trade.price);
+        }
+        let shares = copied_value_usd / trade.price;
+        Amount::shares(shares)?
+    } else {
+        Amount::usdc(copied_value_usd)?
+    };
+
+    let order = client
+        .market_order()
+        .token_id(trade.asset)
+        .side(side)
+        .amount(amount)
+        .order_type(OrderType::FOK)
+        .build()
+        .await?;
+    let signed_order = client.sign(&signer, order).await?;
+    let _ = client.post_order(signed_order).await?;
+    Ok(())
+}
+
+async fn simulation_step(
+    app: &UiAppState,
+    cfg: &CopyConfig,
+    data_client: &polymarket_client_sdk::data::Client,
+    clob_client: &polymarket_client_sdk::clob::Client,
+) -> Result<()> {
+    {
+        let mut runtime = app.runtime.lock().await;
+        runtime.simulation_tick = runtime.simulation_tick.saturating_add(1);
+    }
+
+    let leader = crate::commands::parse_address(&cfg.leader)?;
+    let value_req = ValueRequest::builder().user(leader).build();
+    let leader_value = data_client
+        .value(&value_req)
+        .await
+        .ok()
+        .and_then(|v| v.first().map(|x| x.value))
+        .unwrap_or(Decimal::ONE);
+
+    let closed_req = ClosedPositionsRequest::builder()
+        .user(leader)
+        .limit(200)?
+        .build();
+    let closed_positions = match data_client.closed_positions(&closed_req).await {
+        Ok(positions) => positions,
+        Err(e) => {
+            let mut runtime = app.runtime.lock().await;
+            runtime.warning = Some(format!("Error simulación consultando cerradas: {e}"));
+            Vec::new()
+        }
+    };
+    if !closed_positions.is_empty() {
+        let mut state = load_state()?;
+        let settled = settle_open_movements_from_closed_positions(&mut state, &closed_positions);
+        if !settled.is_empty() {
+            save_state(&state)?;
+            for movement in settled {
+                settle_db_movement(StorageMode::Simulation, &movement.movement_id, movement.pnl)?;
+            }
+        }
+    }
+
+    let trades_req = TradesRequest::builder().user(leader).limit(20)?.build();
+    let trades = match data_client.trades(&trades_req).await {
+        Ok(trades) => trades,
+        Err(e) => {
+            let mut runtime = app.runtime.lock().await;
+            runtime.warning = Some(format!("Error simulación consultando trades: {e}"));
+            Vec::new()
+        }
+    };
+
+    for t in trades {
+        let tx_hash = t.transaction_hash.to_string();
+        {
+            let mut runtime = app.runtime.lock().await;
+            if runtime.last_seen_hashes.contains(&tx_hash) {
+                continue;
+            }
+            runtime.last_seen_hashes.insert(tx_hash.clone());
+        }
+
+        let state = load_state()?;
+        let movement_id = format!("sim-{tx_hash}");
+        if state.movements.iter().any(|m| m.movement_id == movement_id) {
+            continue;
+        }
+
+        let plan = compute_plan(cfg, &state, leader_value, t.size * t.price)?;
+        if plan.capped_size <= Decimal::ZERO {
+            continue;
+        }
+
+        if !has_book_liquidity_for_simulation(clob_client, &t, plan.capped_size).await? {
+            let mut runtime = app.runtime.lock().await;
+            runtime.warning = Some(format!(
+                "Simulación: sin liquidez suficiente para {} ({})",
+                t.slug, tx_hash
+            ));
+            continue;
+        }
+
         let record = MovementRecord {
             movement_id,
-            market,
+            market: t.slug,
             timestamp: Utc::now().to_rfc3339(),
-            leader_value: leader_movement,
+            leader_value: t.size * t.price,
             copied_value: plan.capped_size,
             diff_pct: Decimal::ZERO,
             settled: false,
             pnl: Decimal::ZERO,
         };
-        state.movements.push(record.clone());
+        let mut updated = state;
+        updated.movements.push(record.clone());
+        save_state(&updated)?;
         append_db_movement(StorageMode::Simulation, &record)?;
     }
 
-    // Simulate resolution of older open movements with pseudo-random pnl
-    for m in &mut state.movements {
-        if m.settled {
-            continue;
-        }
-        let should_settle = (tick + m.movement_id.len() as u64).is_multiple_of(3);
-        if should_settle {
-            let sign = if (tick + m.market.len() as u64).is_multiple_of(2) {
-                1
-            } else {
-                -1
-            };
-            let magnitude = Decimal::from(((tick % 4) + 1) as i64) / Decimal::from(20); // 5%-20%
-            m.pnl = m.copied_value * magnitude * Decimal::from(sign);
-            m.settled = true;
-            settle_db_movement(StorageMode::Simulation, &m.movement_id, m.pnl)?;
-        }
+    let mut runtime = app.runtime.lock().await;
+    if runtime.warning.is_none() {
+        runtime.warning = Some(
+            "Modo simulación activo: basado en trades/cierres reales del líder + validación de liquidez"
+                .to_string(),
+        );
     }
-
-    save_state(&state)?;
-    runtime.warning =
-        Some("Modo simulación activo: movimientos y resolución simulados".to_string());
     Ok(())
+}
+
+async fn has_book_liquidity_for_simulation(
+    clob_client: &polymarket_client_sdk::clob::Client,
+    trade: &polymarket_client_sdk::data::types::response::Trade,
+    copied_value_usd: Decimal,
+) -> Result<bool> {
+    let req = OrderBookSummaryRequest::builder()
+        .token_id(trade.asset)
+        .build();
+    let book = clob_client.order_book(&req).await?;
+
+    if trade.side.to_string().eq_ignore_ascii_case("buy") {
+        let mut remaining_usdc = copied_value_usd;
+        for ask in &book.asks {
+            if remaining_usdc <= Decimal::ZERO {
+                break;
+            }
+            let level_notional = ask.size * ask.price;
+            if level_notional >= remaining_usdc {
+                remaining_usdc = Decimal::ZERO;
+                break;
+            }
+            remaining_usdc -= level_notional;
+        }
+        Ok(remaining_usdc <= Decimal::ZERO)
+    } else {
+        if trade.price <= Decimal::ZERO {
+            return Ok(false);
+        }
+        let mut remaining_shares = copied_value_usd / trade.price;
+        for bid in &book.bids {
+            if remaining_shares <= Decimal::ZERO {
+                break;
+            }
+            if bid.size >= remaining_shares {
+                remaining_shares = Decimal::ZERO;
+                break;
+            }
+            remaining_shares -= bid.size;
+        }
+        Ok(remaining_shares <= Decimal::ZERO)
+    }
 }
 
 fn is_rate_limit_error(msg: &str) -> bool {
@@ -780,6 +972,49 @@ fn compute_plan(
         available_funds: available_exposure,
         reason,
     })
+}
+
+fn roi_by_slug_from_totals<'a>(
+    totals: HashMap<&'a str, (Decimal, Decimal)>,
+) -> HashMap<&'a str, Decimal> {
+    totals
+        .into_iter()
+        .filter_map(|(slug, (realized, bought))| {
+            if bought <= Decimal::ZERO {
+                None
+            } else {
+                Some((slug, realized / bought))
+            }
+        })
+        .collect()
+}
+
+fn settle_open_movements_from_closed_positions(
+    state: &mut CopyState,
+    closed_positions: &[polymarket_client_sdk::data::types::response::ClosedPosition],
+) -> Vec<MovementRecord> {
+    let mut realized_and_bought_by_slug: HashMap<&str, (Decimal, Decimal)> = HashMap::new();
+    for closed in closed_positions {
+        let entry = realized_and_bought_by_slug
+            .entry(closed.slug.as_str())
+            .or_insert((Decimal::ZERO, Decimal::ZERO));
+        entry.0 += closed.realized_pnl;
+        entry.1 += closed.total_bought;
+    }
+
+    let roi_by_slug = roi_by_slug_from_totals(realized_and_bought_by_slug);
+
+    let mut settled = Vec::new();
+    for movement in state.movements.iter_mut().filter(|m| !m.settled) {
+        let Some(roi) = roi_by_slug.get(movement.market.as_str()) else {
+            continue;
+        };
+        movement.pnl = movement.copied_value * *roi;
+        movement.settled = true;
+        settled.push(movement.clone());
+    }
+
+    settled
 }
 
 fn base_dir() -> Result<PathBuf> {
@@ -1072,5 +1307,18 @@ mod tests {
         let p = compute_plan(&cfg, &state, d("1000"), d("100")).unwrap();
         assert_eq!(p.capped_size, d("50"));
         assert_eq!(p.available_funds, d("50"));
+    }
+
+    #[test]
+    fn roi_by_slug_from_totals_computes_weighted_roi() {
+        let mut totals = HashMap::new();
+        totals.insert("btc-up", (d("25"), d("100")));
+        totals.insert("eth-down", (d("-10"), d("40")));
+        totals.insert("skip", (d("5"), d("0")));
+
+        let roi = roi_by_slug_from_totals(totals);
+        assert_eq!(roi.get("btc-up"), Some(&d("0.25")));
+        assert_eq!(roi.get("eth-down"), Some(&d("-0.25")));
+        assert!(!roi.contains_key("skip"));
     }
 }
