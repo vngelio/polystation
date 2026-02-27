@@ -22,54 +22,59 @@ echo Host: %HOST%
 echo Port: %PORT%
 echo =========================================
 
-REM 1) Resolve from PATH
+REM 1) Resolve from PATH first
 where polymarket >nul 2>nul
-if %ERRORLEVEL%==0 set "CLI_CMD=polymarket"
+if not errorlevel 1 set "CLI_CMD=polymarket"
 
 REM 2) Resolve from local install dir
 if "%CLI_CMD%"=="" if exist "%LOCAL_EXE%" set "CLI_CMD=%LOCAL_EXE%"
 
-REM 3) Try auto-install when still missing
-if "%CLI_CMD%"=="" (
-  echo [INFO] polymarket.exe no encontrado. Intentando instalar...
+REM 3) Try auto-install if still missing
+if not "%CLI_CMD%"=="" goto :run_ui
 
-  if exist "%SCRIPT_DIR%polymarket.exe" (
-    if not exist "%BIN_DIR%" mkdir "%BIN_DIR%" >nul 2>nul
-    copy /Y "%SCRIPT_DIR%polymarket.exe" "%LOCAL_EXE%" >nul
-    if %ERRORLEVEL% neq 0 goto :fail_copy
-    set "CLI_CMD=%LOCAL_EXE%"
-    echo [OK] Se copio polymarket.exe en "%BIN_DIR%".
-  ) else (
-    where cargo >nul 2>nul
-    if %ERRORLEVEL% neq 0 goto :fail_missing
+echo [INFO] polymarket.exe no encontrado. Intentando instalar...
 
-    pushd "%SCRIPT_DIR%" >nul
-    cargo install --path . --locked --root "%INSTALL_ROOT%"
-    set "INSTALL_ERR=%ERRORLEVEL%"
-    popd >nul
+if exist "%SCRIPT_DIR%polymarket.exe" goto :install_from_local_exe
 
-    if not "%INSTALL_ERR%"=="0" goto :fail_install
+where cargo >nul 2>nul
+if errorlevel 1 goto :fail_missing
 
-    if exist "%LOCAL_EXE%" (
-      set "CLI_CMD=%LOCAL_EXE%"
-    ) else (
-      where polymarket >nul 2>nul
-      if %ERRORLEVEL%==0 set "CLI_CMD=polymarket"
-    )
-  )
+echo [INFO] Compilando e instalando CLI con cargo...
+pushd "%SCRIPT_DIR%" >nul
+cargo install --path . --locked --root "%INSTALL_ROOT%"
+set "INSTALL_ERR=%ERRORLEVEL%"
+popd >nul
+if not "%INSTALL_ERR%"=="0" goto :fail_install
+
+if exist "%LOCAL_EXE%" (
+  set "CLI_CMD=%LOCAL_EXE%"
+) else (
+  where polymarket >nul 2>nul
+  if not errorlevel 1 set "CLI_CMD=polymarket"
 )
 
 if "%CLI_CMD%"=="" goto :fail_not_resolved
+goto :run_ui
 
-REM Best-effort: keep available now + persist in user PATH.
+:install_from_local_exe
+if not exist "%BIN_DIR%" mkdir "%BIN_DIR%" >nul 2>nul
+copy /Y "%SCRIPT_DIR%polymarket.exe" "%LOCAL_EXE%" >nul
+if errorlevel 1 goto :fail_copy
+set "CLI_CMD=%LOCAL_EXE%"
+echo [OK] Se copio polymarket.exe en "%BIN_DIR%".
+
+goto :run_ui
+
+:run_ui
+if not exist "%BIN_DIR%" goto :run_launch
 set "PATH=%PATH%;%BIN_DIR%"
 setx PATH "%PATH%" >nul 2>nul
 
+:run_launch
 echo [INFO] Ejecutando: "%CLI_CMD%" copy ui --host %HOST% --port %PORT%
 echo.
 "%CLI_CMD%" copy ui --host %HOST% --port %PORT%
 set "RUN_ERR=%ERRORLEVEL%"
-
 if not "%RUN_ERR%"=="0" goto :fail_run
 
 echo.
