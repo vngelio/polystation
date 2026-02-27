@@ -1,0 +1,84 @@
+<!doctype html>
+<html><head><meta charset="utf-8"/><title>Polymarket Copy UI</title>
+<style>
+body{font-family:system-ui,Arial;margin:20px} input{margin:4px} table{border-collapse:collapse;width:100%} td,th{border:1px solid #ddd;padding:6px;font-size:13px}
+.row{display:flex;gap:10px;flex-wrap:wrap} .ok{color:#0a7f2e}.bad{color:#b20000}
+.tabs button{padding:8px 12px;margin-right:8px}.active{background:#0b57d0;color:#fff}
+</style>
+</head><body>
+<h2>Copy Trading UI</h2>
+<p>Pega aquí el token que el CLI imprime al iniciar <code>copy ui</code>:</p>
+<input id="token" placeholder="UI API token" size="70"/>
+<div class="tabs">
+  <button id="tabReal" class="active" onclick="setMode('real')">Modo real</button>
+  <button id="tabSim" onclick="setMode('simulacion')">Modo simulación</button>
+</div>
+<div class="row">
+<input id="leader" placeholder="Cuenta a copiar 0x..." size="44"/>
+<input id="funds" placeholder="Fondos iniciales" value="1000"/>
+<input id="maxTrade" placeholder="Max trade %" value="5"/>
+<input id="maxExposure" placeholder="Max exposure %" value="70"/>
+<input id="minCopy" placeholder="Min copy USD" value="1"/>
+<label><input type="checkbox" id="realtimeMode" onchange="toggleRealtime()"/> Modo tiempo real (solo real)</label>
+<input id="pollMs" type="number" min="500" step="250" placeholder="Poll ms" value="2000"/>
+<label><input type="checkbox" id="execute"/> Execute orders (experimental)</label>
+<button onclick="configure()">Guardar config</button>
+<button onclick="startCopy()">Start</button>
+<button onclick="stopCopy()">Stop</button>
+</div>
+<p id="status"></p>
+<h3>Movimientos</h3>
+<table><thead><tr><th>Hora</th><th>Mercado</th><th>Leader $</th><th>Copiado $</th><th>Settled</th><th>PnL</th></tr></thead><tbody id="moves"></tbody></table>
+<h3>Beneficio diario</h3><pre id="daily"></pre>
+<h3>Beneficio histórico (acumulado)</h3><pre id="historical"></pre>
+<script>
+let latest=0;
+let mode='real';
+function auth(){const t=token.value.trim(); if(!t) throw new Error('Falta token'); return t;}
+function setMode(m){
+  mode=m;
+  tabReal.classList.toggle('active', m==='real');
+  tabSim.classList.toggle('active', m==='simulacion');
+  if(m==='simulacion'){realtimeMode.checked=false; realtimeMode.disabled=true; pollMs.min=500; if(Number(pollMs.value)<500) pollMs.value=2000;}
+  else{realtimeMode.disabled=false; toggleRealtime();}
+}
+function toggleRealtime(){
+  if(mode!=='real'){ pollMs.min=500; pollMs.step=250; return; }
+  if(realtimeMode.checked){ pollMs.min=50; pollMs.step=250; if(Number(pollMs.value)<50) pollMs.value=50; }
+  else { pollMs.min=500; pollMs.step=250; if(Number(pollMs.value)<500) pollMs.value=2000; }
+}
+async function api(path,opts={}){
+  const t=auth(); const sep=path.includes('?')?'&':'?';
+  const r=await fetch(`${path}${sep}token=${encodeURIComponent(t)}`,{headers:{'content-type':'application/json','x-api-key':t},...opts});
+  if(!r.ok) throw new Error(await r.text()); return r.json();
+}
+async function configure(){
+ const rt = mode==='real' && realtimeMode.checked;
+ const minMs = rt ? 50 : 500;
+ const payload={
+  leader:leader.value,allocated_funds:funds.value,max_trade_pct:maxTrade.value,max_total_exposure_pct:maxExposure.value,min_copy_usd:minCopy.value,
+  poll_interval_secs:Math.max(1,Math.round(Number(pollMs.value)/1000)),poll_interval_ms:Math.max(minMs,Number(pollMs.value)||2000),
+  risk_level:'balanced',execute_orders:execute.checked,realtime_mode:rt,simulation_mode:(mode==='simulacion')
+ };
+ await api('/api/configure',{method:'POST',body:JSON.stringify(payload)}); await fullRefresh();
+}
+async function startCopy(){await api('/api/start',{method:'POST'}); await fullRefresh();}
+async function stopCopy(){await api('/api/stop',{method:'POST'}); await fullRefresh();}
+function bars(v){const n=Math.min(40,Math.abs(Math.trunc(Number(v)))); return v<0?'-'.repeat(n)+'|':'|'+ '+'.repeat(n)}
+function prependMove(m){const tr=document.createElement('tr'); tr.innerHTML=`<td>${m.timestamp}</td><td>${m.market}</td><td>${m.leader_value}</td><td>${m.copied_value}</td><td>${m.settled}</td><td>${m.pnl}</td>`; moves.prepend(tr); while(moves.children.length>300){moves.removeChild(moves.lastChild)}}
+async function pollUpdates(){try{const u=await api(`/api/updates?since=${latest}`); latest=u.latest_id||latest; (u.movements||[]).forEach(prependMove);}catch(e){status.textContent='Error updates: '+e.message; status.className='bad'}}
+async function fullRefresh(){
+ try{
+   const s=await api('/api/state');
+   setMode(s.active_mode==='simulacion'?'simulacion':'real');
+   status.textContent=`Modo: ${s.active_mode} | Monitoring: ${s.monitoring} | Poll: ${s.current_poll_interval_ms}ms | Movimientos: ${s.movement_count}`;
+   status.className=s.warning?'bad':'ok'; if(s.warning){status.textContent += ` | Aviso: ${s.warning}`;}
+   if(s.config){leader.value=s.config.leader; funds.value=s.config.allocated_funds; maxTrade.value=s.config.max_trade_pct; maxExposure.value=s.config.max_total_exposure_pct; minCopy.value=s.config.min_copy_usd; execute.checked=!!s.config.execute_orders; realtimeMode.checked=!!s.config.realtime_mode;}
+   pollMs.value=s.current_poll_interval_ms || 2000; toggleRealtime();
+   daily.textContent=(s.daily_pnl||[]).map(d=>`${d[0]} ${bars(Number(d[1]))} ${d[1]}`).join('\n');
+   historical.textContent=(s.historical_pnl||[]).map(d=>`${d[0]} ${bars(Number(d[1]))} ${d[1]}`).join('\n');
+ }catch(e){status.textContent='Error: '+e.message; status.className='bad'}
+}
+setInterval(pollUpdates,500); setInterval(fullRefresh,4000); toggleRealtime();
+</script>
+</body></html>
