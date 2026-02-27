@@ -1,8 +1,8 @@
 @echo off
-setlocal EnableExtensions EnableDelayedExpansion
+setlocal EnableExtensions
 
-REM Launch Polymarket copy-trading local web UI on Windows (double-click friendly)
-REM Usage (optional): polymarket-ui.bat [host] [port]
+REM Double-click launcher for Polymarket copy UI on Windows
+REM Usage: polymarket-ui.bat [host] [port]
 
 set "HOST=%~1"
 if "%HOST%"=="" set "HOST=127.0.0.1"
@@ -22,96 +22,86 @@ echo Host: %HOST%
 echo Port: %PORT%
 echo =========================================
 
-REM 1) Try system PATH first
+REM 1) Resolve from PATH
 where polymarket >nul 2>nul
-if %ERRORLEVEL%==0 (
-  set "CLI_CMD=polymarket"
-)
+if %ERRORLEVEL%==0 set "CLI_CMD=polymarket"
 
-REM 2) If not in PATH, try known local install path
-if "%CLI_CMD%"=="" (
-  if exist "%LOCAL_EXE%" (
-    set "CLI_CMD=%LOCAL_EXE%"
-  )
-)
+REM 2) Resolve from local install dir
+if "%CLI_CMD%"=="" if exist "%LOCAL_EXE%" set "CLI_CMD=%LOCAL_EXE%"
 
-REM 3) If still missing, try auto-install
+REM 3) Try auto-install when still missing
 if "%CLI_CMD%"=="" (
-  echo [INFO] polymarket.exe no esta disponible. Intentando instalar automaticamente...
+  echo [INFO] polymarket.exe no encontrado. Intentando instalar...
 
   if exist "%SCRIPT_DIR%polymarket.exe" (
     if not exist "%BIN_DIR%" mkdir "%BIN_DIR%" >nul 2>nul
     copy /Y "%SCRIPT_DIR%polymarket.exe" "%LOCAL_EXE%" >nul
-    if %ERRORLEVEL% neq 0 (
-      echo [ERROR] No se pudo copiar polymarket.exe a "%BIN_DIR%".
-      echo.
-      pause
-      exit /b 1
-    )
+    if %ERRORLEVEL% neq 0 goto :fail_copy
     set "CLI_CMD=%LOCAL_EXE%"
-    echo [OK] Copiado polymarket.exe localmente.
+    echo [OK] Se copio polymarket.exe en "%BIN_DIR%".
   ) else (
     where cargo >nul 2>nul
-    if %ERRORLEVEL% neq 0 (
-      echo [ERROR] No se encontro polymarket.exe junto al launcher ni cargo para compilar.
-      echo Coloca polymarket.exe junto a este .bat o instala Rust/Cargo y vuelve a intentarlo.
-      echo.
-      pause
-      exit /b 1
-    )
+    if %ERRORLEVEL% neq 0 goto :fail_missing
 
     pushd "%SCRIPT_DIR%" >nul
     cargo install --path . --locked --root "%INSTALL_ROOT%"
     set "INSTALL_ERR=%ERRORLEVEL%"
     popd >nul
 
-    if not "%INSTALL_ERR%"=="0" (
-      echo [ERROR] Fallo la instalacion automatica de polymarket CLI.
-      echo.
-      pause
-      exit /b 1
-    )
+    if not "%INSTALL_ERR%"=="0" goto :fail_install
 
     if exist "%LOCAL_EXE%" (
       set "CLI_CMD=%LOCAL_EXE%"
+    ) else (
+      where polymarket >nul 2>nul
+      if %ERRORLEVEL%==0 set "CLI_CMD=polymarket"
     )
   )
 )
 
-if "%CLI_CMD%"=="" (
-  echo [ERROR] No fue posible resolver el ejecutable de Polymarket.
-  echo.
-  pause
-  exit /b 1
-)
+if "%CLI_CMD%"=="" goto :fail_not_resolved
 
-REM Optional best effort PATH update (no bloquear si falla)
-if not exist "%BIN_DIR%" goto RUN_UI
+REM Best-effort: keep available now + persist in user PATH.
+set "PATH=%PATH%;%BIN_DIR%"
+setx PATH "%PATH%" >nul 2>nul
 
-echo [INFO] Intentando registrar "%BIN_DIR%" en PATH de usuario...
-for /f "tokens=2,*" %%A in ('reg query "HKCU\Environment" /v Path 2^>nul ^| find /I "Path"') do set "USER_PATH=%%B"
-if defined USER_PATH (
-  echo !USER_PATH! | find /I "%BIN_DIR%" >nul
-  if !ERRORLEVEL! neq 0 (
-    setx Path "!USER_PATH!;%BIN_DIR%" >nul 2>nul
-  )
-) else (
-  setx Path "%BIN_DIR%" >nul 2>nul
-)
-
-:RUN_UI
 echo [INFO] Ejecutando: "%CLI_CMD%" copy ui --host %HOST% --port %PORT%
 echo.
 "%CLI_CMD%" copy ui --host %HOST% --port %PORT%
 set "RUN_ERR=%ERRORLEVEL%"
 
-echo.
-if not "%RUN_ERR%"=="0" (
-  echo [ERROR] La UI termino con error (code %RUN_ERR%).
-) else (
-  echo [INFO] La UI finalizo.
-)
+if not "%RUN_ERR%"=="0" goto :fail_run
 
+echo.
+echo [OK] La UI termino correctamente.
+goto :end
+
+:fail_copy
+echo.
+echo [ERROR] No se pudo copiar polymarket.exe a "%BIN_DIR%".
+goto :end
+
+:fail_missing
+echo.
+echo [ERROR] No se encontro polymarket.exe junto al .bat y tampoco cargo para instalar.
+echo         Coloca polymarket.exe junto a este launcher o instala Rust/Cargo.
+goto :end
+
+:fail_install
+echo.
+echo [ERROR] Fallo la instalacion automatica de polymarket CLI.
+goto :end
+
+:fail_not_resolved
+echo.
+echo [ERROR] No se pudo resolver el ejecutable de Polymarket.
+goto :end
+
+:fail_run
+echo.
+echo [ERROR] La UI termino con error (code %RUN_ERR%).
+
+:end
 echo.
 pause
 endlocal
