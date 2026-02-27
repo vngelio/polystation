@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
+    hash::{Hash, Hasher},
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
@@ -840,9 +841,30 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn generate_api_token() -> Result<String> {
-    let mut f = fs::File::open("/dev/urandom").context("failed to open /dev/urandom")?;
     let mut buf = [0u8; 32];
-    f.read_exact(&mut buf)?;
+
+    if let Ok(mut f) = fs::File::open("/dev/urandom") {
+        if f.read_exact(&mut buf).is_ok() {
+            return Ok(buf.iter().map(|b| format!("{b:02x}")).collect());
+        }
+    }
+
+    // Cross-platform fallback when /dev/urandom is unavailable (e.g. Windows).
+    // Token is only used for local UI auth and remains process-local.
+    for i in 0..4u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .hash(&mut hasher);
+        std::process::id().hash(&mut hasher);
+        i.hash(&mut hasher);
+        let block = hasher.finish().to_le_bytes();
+        let start = (i as usize) * 8;
+        buf[start..start + 8].copy_from_slice(&block);
+    }
+
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
