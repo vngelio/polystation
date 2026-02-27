@@ -29,6 +29,24 @@ cargo install --path .
 
 ## Quick Start
 
+
+### Windows (doble click)
+
+También puedes iniciar la interfaz web con doble click en Windows usando el launcher incluido:
+
+- `polymarket-ui.bat`
+
+Este archivo ejecuta:
+
+```bat
+polymarket copy ui --host 127.0.0.1 --port 8787
+```
+
+Requisitos:
+
+- Tener `polymarket.exe` instalado y disponible en `PATH`.
+- Al arrancar, la CLI imprimirá un `UI API token`; pégalo en la interfaz para habilitar acciones.
+
 ```bash
 # No wallet needed — browse markets immediately
 polymarket markets list --limit 5
@@ -406,6 +424,56 @@ polymarket shell
 
 Supports command history. All commands work the same as the CLI, just without the `polymarket` prefix.
 
+
+### Copy Trading Assistant (new)
+
+Configure a leader account and copy movements proportionally to your allocated capital, with risk caps and exposure controls.
+
+```bash
+# 1) Configure
+polymarket copy configure \
+  --leader 0xLEADER... \
+  --allocated-funds 1000 \
+  --max-trade-pct 5 \
+  --max-total-exposure-pct 70 \
+  --min-copy-usd 1
+
+# 2) For each detected leader movement, compute safe proportional size
+polymarket copy plan --leader-positions-value 25000 --leader-movement-value 100
+
+# 3) Record copied movement and settle once resolved
+polymarket copy record --movement-id ORD123 --market election-2028 --leader-value 100 --copied-value 4 --diff-pct -0.4
+polymarket copy settle --movement-id ORD123 --pnl 1.2
+
+# 4) Check status/dashboard (includes daily + historical PnL charts in terminal)
+polymarket copy status
+polymarket copy dashboard
+
+# 5) Abrir interfaz web real
+polymarket copy ui --host 127.0.0.1 --port 8787
+# (El CLI imprime un API token; pégalo en la UI para habilitar control seguro)
+```
+
+
+La UI guarda histórico en una base de datos local JSONL en `~/.config/polymarket/copy_trader_real_db.jsonl` (real) y `~/.config/polymarket/copy_trader_sim_db.jsonl` (simulación) y usa endpoint incremental de actualizaciones para minimizar latencia de render.
+
+La UI tiene dos pestañas mutuamente excluyentes: **Modo real** y **Modo simulación**.
+- En **Modo real** puedes activar además la casilla de **Modo tiempo real** para bajar hasta 50ms (siempre con backoff automático +250ms en rate-limit/429).
+- En **Modo simulación** se desactiva el modo real y se simula la copia proporcional de movimientos usando la misma lógica de riesgo, incluyendo ganancias/pérdidas simuladas al resolver movimientos.
+
+Flujo operativo de cada modo:
+
+1. **Modo real**
+   - Consulta valor de posiciones del líder + últimas operaciones.
+   - Deduplica por hash de transacción para evitar replays.
+   - Calcula tamaño a copiar con la misma función de riesgo (proporcional por fondos asignados + caps de trade/exposición + mínimo en USD).
+   - Persiste cada movimiento copiado en el historial real.
+2. **Modo simulación**
+   - Genera movimientos sintéticos del líder por `tick`.
+   - Reutiliza exactamente la misma función de sizing/riesgo que en real.
+   - Registra movimientos `sim-*` en el historial de simulación.
+   - Liquida periódicamente posiciones simuladas y aplica PnL sintético para evaluar estrategia.
+
 ### Other
 
 ```bash
@@ -415,6 +483,24 @@ polymarket upgrade    # Update to the latest version
 polymarket --version
 polymarket --help
 ```
+
+
+## Funciones principales de la aplicación
+
+- **Exploración de mercado**: listar/buscar mercados y eventos sin wallet.
+- **Trading CLOB**: crear/cancelar órdenes y consultar books/precios.
+- **Operaciones on-chain**: approvals, CTF, bridge.
+- **Copy trading** (`polymarket copy`):
+  - `configure`: define líder, fondos y riesgo.
+  - `plan`: calcula tamaño proporcional con caps.
+  - `record`: registra movimiento.
+  - `settle`: marca resolución y PnL.
+  - `status`: estado resumido.
+  - `dashboard`: vista de movimientos + PnL.
+  - `ui`: interfaz web local interactiva.
+- **Persistencia local copy trading**:
+  - Config y estado en `~/.config/polymarket/`.
+  - Históricos separados por modo (real/simulación).
 
 ## Common Workflows
 
@@ -475,6 +561,43 @@ if ! result=$(polymarket -o json clob balance --asset-type collateral 2>/dev/nul
   echo "Failed to fetch balance"
 fi
 ```
+
+
+## Interfaz web (Copy Trading UI)
+
+Al ejecutar `polymarket copy ui`, se levanta un servidor local en `http://127.0.0.1:8787` (o el host/puerto que indiques).
+
+### Flujo de uso
+
+1. Inicia la UI (`polymarket copy ui --host 127.0.0.1 --port 8787`).
+2. Copia el `UI API token` mostrado en consola.
+3. Pega el token en la caja superior de la interfaz.
+4. Elige pestaña:
+   - **Modo real**: seguimiento real de movimientos.
+   - **Modo simulación**: simulación de movimientos y resolución de PnL.
+5. Configura cuenta líder, fondos y parámetros de riesgo.
+6. Pulsa **Guardar config** y luego **Start**.
+
+### Elementos principales de la UI
+
+- **Pestañas de modo**:
+  - `Modo real`
+  - `Modo simulación`
+  - Son mutuamente excluyentes.
+- **Parámetros de riesgo**:
+  - `max-trade-pct`
+  - `max-total-exposure-pct`
+  - `min-copy-usd`
+- **Polling**:
+  - En modo real, opcionalmente puede activarse “modo tiempo real”.
+  - Si hay rate-limit/throttling, el sistema aumenta el intervalo automáticamente.
+- **Panel de estado**:
+  - Modo activo, monitorización, intervalo de polling y avisos.
+- **Tabla de movimientos**:
+  - Entradas incrementales de movimientos copiados/simulados.
+- **Gráficas ASCII**:
+  - Beneficio diario.
+  - Beneficio histórico acumulado.
 
 ## Architecture
 
