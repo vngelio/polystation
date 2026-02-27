@@ -74,6 +74,9 @@ setx PATH "%PATH%" >nul 2>nul
 echo [INFO] Abriendo consola interactiva de Polymarket (shell)...
 start "Polymarket CLI" cmd /k ""%CLI_CMD%" shell"
 
+echo [INFO] Se abrira el navegador en http://%HOST%:%PORT% (tras 2s)...
+start "" "http://%HOST%:%PORT%"
+
 echo [INFO] Ejecutando: "%CLI_CMD%" copy ui --host %HOST% --port %PORT%
 echo.
 "%CLI_CMD%" copy ui --host %HOST% --port %PORT%

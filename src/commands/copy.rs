@@ -474,6 +474,12 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
                     return Ok(());
                 }
                 runtime.monitoring = true;
+                let mode = runtime
+                    .config
+                    .as_ref()
+                    .map(|c| if c.simulation_mode { "sim" } else { "real" })
+                    .unwrap_or("real");
+                log_copy_event(mode, "monitor iniciado");
             }
             let app_clone = app.clone();
             tokio::spawn(async move {
@@ -484,12 +490,22 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
         ("POST", "/api/stop") => {
             let mut runtime = app.runtime.lock().await;
             runtime.monitoring = false;
+            let mode = runtime
+                .config
+                .as_ref()
+                .map(|c| if c.simulation_mode { "sim" } else { "real" })
+                .unwrap_or("real");
+            log_copy_event(mode, "monitor detenido");
             write_response(&mut stream, "200 OK", "application/json", "{\"ok\":true}")?;
         }
         _ => write_response(&mut stream, "404 Not Found", "text/plain", "not found")?,
     }
 
     Ok(())
+}
+
+fn log_copy_event(mode: &str, message: impl AsRef<str>) {
+    println!("[copy:{mode}] {}", message.as_ref());
 }
 
 async fn monitor_loop(app: UiAppState) -> Result<()> {
@@ -519,6 +535,7 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
         };
 
         if cfg.simulation_mode {
+            log_copy_event("sim", format!("tick simulacion (poll={}ms)", poll_ms));
             simulation_step(&app, &cfg, &data_client, &clob_client).await?;
             tokio::time::sleep(Duration::from_millis(poll_ms)).await;
             continue;
@@ -568,6 +585,13 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             if !settled.is_empty() {
                 save_state(&state)?;
                 for movement in settled {
+                    log_copy_event(
+                        "real",
+                        format!(
+                            "resuelta {} (mercado={}) pnl={} -> fondos liberados",
+                            movement.movement_id, movement.market, movement.pnl
+                        ),
+                    );
                     settle_db_movement(StorageMode::Real, &movement.movement_id, movement.pnl)?;
                 }
             }
@@ -616,14 +640,34 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
 
             let plan = compute_plan(&cfg, &state, leader_value, t.size * t.price)?;
             if plan.capped_size <= Decimal::ZERO {
+                log_copy_event(
+                    "real",
+                    format!(
+                        "trade detectado {} ({}) sin copia (motivo: {})",
+                        t.slug, tx_hash, plan.reason
+                    ),
+                );
                 continue;
             }
+
+            log_copy_event(
+                "real",
+                format!(
+                    "nueva apuesta detectada {} ({}) leader_usd={} copia_plan={} motivo={}",
+                    t.slug,
+                    tx_hash,
+                    t.size * t.price,
+                    plan.capped_size,
+                    plan.reason
+                ),
+            );
 
             if cfg.execute_orders
                 && let Err(e) = execute_copy_order_from_trade(&t, plan.capped_size).await
             {
                 let mut runtime = app.runtime.lock().await;
                 runtime.warning = Some(format!("Error ejecutando orden en wallet: {e}"));
+                log_copy_event("real", format!("error copiando orden {}: {e}", tx_hash));
                 continue;
             }
 
@@ -641,10 +685,22 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             updated.movements.push(record.clone());
             save_state(&updated)?;
             append_db_movement(StorageMode::Real, &record)?;
+            if cfg.execute_orders {
+                log_copy_event(
+                    "real",
+                    format!("orden copiada {} guardada en historial", record.movement_id),
+                );
+            } else {
+                log_copy_event(
+                    "real",
+                    format!("orden registrada (dry-run) {}", record.movement_id),
+                );
+            }
         }
 
         tokio::time::sleep(Duration::from_millis(poll_ms)).await;
     }
+    log_copy_event("core", "monitor loop finalizado");
     Ok(())
 }
 
@@ -722,6 +778,13 @@ async fn simulation_step(
         if !settled.is_empty() {
             save_state(&state)?;
             for movement in settled {
+                log_copy_event(
+                    "sim",
+                    format!(
+                        "resuelta simulacion {} (mercado={}) pnl={} -> fondos liberados",
+                        movement.movement_id, movement.market, movement.pnl
+                    ),
+                );
                 settle_db_movement(StorageMode::Simulation, &movement.movement_id, movement.pnl)?;
             }
         }
@@ -755,8 +818,27 @@ async fn simulation_step(
 
         let plan = compute_plan(cfg, &state, leader_value, t.size * t.price)?;
         if plan.capped_size <= Decimal::ZERO {
+            log_copy_event(
+                "sim",
+                format!(
+                    "trade detectado {} ({}) sin simulacion (motivo: {})",
+                    t.slug, tx_hash, plan.reason
+                ),
+            );
             continue;
         }
+
+        log_copy_event(
+            "sim",
+            format!(
+                "nueva apuesta detectada {} ({}) leader_usd={} simulacion_plan={} motivo={}",
+                t.slug,
+                tx_hash,
+                t.size * t.price,
+                plan.capped_size,
+                plan.reason
+            ),
+        );
 
         if !has_book_liquidity_for_simulation(clob_client, &t, plan.capped_size).await? {
             let mut runtime = app.runtime.lock().await;
@@ -764,6 +846,13 @@ async fn simulation_step(
                 "Simulación: sin liquidez suficiente para {} ({})",
                 t.slug, tx_hash
             ));
+            log_copy_event(
+                "sim",
+                format!(
+                    "simulacion descartada por liquidez {} ({})",
+                    t.slug, tx_hash
+                ),
+            );
             continue;
         }
 
@@ -781,6 +870,10 @@ async fn simulation_step(
         updated.movements.push(record.clone());
         save_state(&updated)?;
         append_db_movement(StorageMode::Simulation, &record)?;
+        log_copy_event(
+            "sim",
+            format!("apuesta simulada registrada {}", record.movement_id),
+        );
     }
 
     let mut runtime = app.runtime.lock().await;

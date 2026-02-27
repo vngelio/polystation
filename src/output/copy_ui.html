@@ -790,7 +790,7 @@ td.ts  { color: var(--text-dim); font-size: 11px; }
 document.getElementById('buildStamp').textContent = 'BUILD ' + Date.now().toString(36).toUpperCase();
 
 // ── STATE ──────────────────────────────────────
-let latest = 0, mode = 'real', localModeDirty = false, moveCount = 0;
+let latest = 0, mode = 'real', localModeDirty = false, pollDirty = false, configDirty = false, moveCount = 0;
 
 const toNum = (v) => {
   const n = Number(v);
@@ -802,6 +802,58 @@ const fmtUsd = (v) => {
   return `$${n.toFixed(2)}`;
 };
 
+const DRAFT_KEY = 'polystation.copyUiDraft.v1';
+
+function saveDraft(){
+  const draft = {
+    token: document.getElementById('token').value,
+    leader: document.getElementById('leader').value,
+    funds: document.getElementById('funds').value,
+    maxTrade: document.getElementById('maxTrade').value,
+    maxExposure: document.getElementById('maxExposure').value,
+    minCopy: document.getElementById('minCopy').value,
+    pollMs: document.getElementById('pollMs').value,
+    execute: document.getElementById('execute').checked,
+    realtimeMode: document.getElementById('realtimeMode').checked,
+    mode
+  };
+  localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+}
+
+function loadDraft(){
+  const raw = localStorage.getItem(DRAFT_KEY);
+  if(!raw) return;
+  try {
+    const d = JSON.parse(raw);
+    let hasDraftConfig = false;
+    if(typeof d.token === 'string') document.getElementById('token').value = d.token;
+    if(typeof d.leader === 'string') { document.getElementById('leader').value = d.leader; hasDraftConfig = true; }
+    if(typeof d.funds === 'string') { document.getElementById('funds').value = d.funds; hasDraftConfig = true; }
+    if(typeof d.maxTrade === 'string') { document.getElementById('maxTrade').value = d.maxTrade; hasDraftConfig = true; }
+    if(typeof d.maxExposure === 'string') { document.getElementById('maxExposure').value = d.maxExposure; hasDraftConfig = true; }
+    if(typeof d.minCopy === 'string') { document.getElementById('minCopy').value = d.minCopy; hasDraftConfig = true; }
+    if(typeof d.pollMs === 'string') { document.getElementById('pollMs').value = d.pollMs; hasDraftConfig = true; pollDirty = true; }
+    if(typeof d.execute === 'boolean') { document.getElementById('execute').checked = d.execute; hasDraftConfig = true; }
+    if(typeof d.realtimeMode === 'boolean') { document.getElementById('realtimeMode').checked = d.realtimeMode; hasDraftConfig = true; }
+    if(d.mode === 'simulacion' || d.mode === 'real') setMode(d.mode, 'draft');
+    if(hasDraftConfig) configDirty = true;
+  } catch(_) {}
+}
+
+function bindDraftPersistence(){
+  const configFields = ['leader','funds','maxTrade','maxExposure','minCopy','pollMs','execute','realtimeMode'];
+  configFields.forEach((id) => {
+    const el = document.getElementById(id);
+    const ev = (el.type === 'checkbox') ? 'change' : 'input';
+    el.addEventListener(ev, () => {
+      configDirty = true;
+      if(id === 'pollMs') pollDirty = true;
+      saveDraft();
+    });
+  });
+  document.getElementById('token').addEventListener('input', saveDraft);
+}
+
 function auth(){
   const t = document.getElementById('token').value.trim();
   if(!t) throw new Error('TOKEN REQUERIDO');
@@ -810,7 +862,7 @@ function auth(){
 
 function setMode(m, src='server'){
   mode = m;
-  if(src === 'user') localModeDirty = true;
+  if(src === 'user') { localModeDirty = true; saveDraft(); }
   document.getElementById('tabReal').classList.toggle('active', m === 'real');
   document.getElementById('tabSim').classList.toggle('active',  m === 'simulacion');
   document.getElementById('modeLabel').textContent = m.toUpperCase();
@@ -820,7 +872,7 @@ function setMode(m, src='server'){
     document.getElementById('realOnlyControls').classList.add('hidden');
     document.getElementById('simOnlyHint').classList.remove('hidden');
     const p = document.getElementById('pollMs');
-    p.min = 500; if(Number(p.value) < 500) p.value = 2000;
+    p.min = 500; if(Number(p.value) < 500) p.value = 500;
   } else {
     document.getElementById('realOnlyControls').classList.remove('hidden');
     document.getElementById('simOnlyHint').classList.add('hidden');
@@ -834,7 +886,7 @@ function toggleRealtime(){
   const p  = document.getElementById('pollMs');
   const rt = document.getElementById('realtimeMode').checked;
   if(rt){ p.min = 50;  if(Number(p.value) < 50)  p.value = 50; }
-  else  { p.min = 500; if(Number(p.value) < 500) p.value = 2000; }
+  else  { p.min = 500; if(Number(p.value) < 500) p.value = 500; }
 }
 
 async function api(path, opts={}){
@@ -865,6 +917,9 @@ async function configure(){
     simulation_mode:        (mode==='simulacion')
   })});
   localModeDirty = false;
+  pollDirty = false;
+  configDirty = false;
+  saveDraft();
   document.getElementById('modeHint').classList.add('hidden');
   await fullRefresh();
 }
@@ -972,7 +1027,9 @@ async function fullRefresh(){
     const pm=s.current_poll_interval_ms;
     document.getElementById('pollDisplay').textContent=pm||'—';
     document.getElementById('topPoll').textContent=pm||'—';
-    document.getElementById('pollMs').value=pm||2000;
+    if(!pollDirty && !localModeDirty){
+      document.getElementById('pollMs').value=pm||2000;
+    }
 
     const initialFunds = toNum(s.initial_allocated_funds);
     const currentEquity = toNum(s.current_equity);
@@ -997,7 +1054,7 @@ async function fullRefresh(){
       document.getElementById('warnVal').textContent='—'; document.getElementById('warnVal').style.color='';
       document.getElementById('warnHint').textContent='sin alertas'; document.getElementById('warnHint').style.color='';
     }
-    if(s.config&&!localModeDirty){
+    if(s.config && !localModeDirty && !configDirty){
       document.getElementById('leader').value    =s.config.leader||'';
       document.getElementById('funds').value     =s.config.allocated_funds||1000;
       document.getElementById('maxTrade').value  =s.config.max_trade_pct||5;
@@ -1005,6 +1062,7 @@ async function fullRefresh(){
       document.getElementById('minCopy').value   =s.config.min_copy_usd||1;
       document.getElementById('execute').checked =!!s.config.execute_orders;
       document.getElementById('realtimeMode').checked=!!s.config.realtime_mode;
+      saveDraft();
     }
     toggleRealtime();
     drawChart('dailyChart',      s.daily_pnl||[],      '#5dff95','rgba(93,255,149,0.14)','dailyLast');
@@ -1022,6 +1080,8 @@ window.addEventListener('resize',()=>{
   drawChart('dailyChart',      [],'#5dff95','rgba(93,255,149,0.14)','dailyLast');
   drawChart('historicalChart', [],'#20eeff','rgba(32,238,255,0.10)', 'histLast');
 });
+loadDraft();
+bindDraftPersistence();
 toggleRealtime();
 setTimeout(()=>{
   drawChart('dailyChart',      [],'#5dff95','rgba(93,255,149,0.14)','dailyLast');

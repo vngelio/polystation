@@ -572,6 +572,7 @@ Al ejecutar `polymarket copy ui`, se levanta un servidor local en `http://127.0.
 1. Inicia la UI (`polymarket copy ui --host 127.0.0.1 --port 8787`).
 2. Copia el `UI API token` mostrado en consola.
 3. Pega el token en la caja superior de la interfaz.
+   - Token, cuenta líder y parámetros quedan guardados en el navegador (localStorage) para que no se borren al refrescar la página.
 4. Elige pestaña:
    - **Modo real**: seguimiento real de movimientos.
    - **Modo simulación**: simulación de movimientos y resolución de PnL.
@@ -598,6 +599,37 @@ Al ejecutar `polymarket copy ui`, se levanta un servidor local en `http://127.0.
 - **Gráficas ASCII**:
   - Beneficio diario.
   - Beneficio histórico acumulado.
+
+
+### Log detallado en consola (CMD)
+
+Cuando ejecutas `polymarket copy ui` (incluyendo desde `polymarket-ui.bat`), la consola queda abierta mostrando un log operativo continuo, tanto en **real** como en **simulación**:
+
+- inicio/parada de monitor
+- detección de nueva apuesta del líder
+- decisión del plan (`copia`, `simulación` o `sin copia` + motivo)
+- intento de ejecución real en wallet y errores
+- registro de apuestas simuladas
+- resolución de movimientos y PnL aplicado (con liberación de fondos)
+
+Formato de ejemplo:
+
+```text
+[copy:real] nueva apuesta detectada ...
+[copy:real] orden copiada ...
+[copy:real] resuelta ... pnl=... -> fondos liberados
+[copy:sim] nueva apuesta detectada ...
+[copy:sim] apuesta simulada registrada ...
+```
+
+### Launcher Windows (`polymarket-ui.bat`)
+
+Si todo está correcto (CLI resuelto/instalado), el launcher:
+
+1. Arranca `polymarket copy ui --host ... --port ...`.
+2. Abre automáticamente el navegador en `http://HOST:PORT`.
+3. Mantiene la consola visible para ver el log de actividad en tiempo real.
+
 
 ## Architecture
 
