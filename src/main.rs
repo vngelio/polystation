@@ -54,6 +54,8 @@ enum Commands {
     Clob(commands::clob::ClobArgs),
     /// CTF operations: split, merge, redeem positions
     Ctf(commands::ctf::CtfArgs),
+    /// Copy-trading helper workflow and dashboard
+    Copy(commands::copy::CopyArgs),
     /// Query on-chain data (positions, trades, leaderboards)
     Data(commands::data::DataArgs),
     /// Bridge assets from other chains to Polymarket
@@ -165,6 +167,7 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Ctf(args) => {
             commands::ctf::execute(args, cli.output, cli.private_key.as_deref()).await
         }
+        Commands::Copy(args) => commands::copy::execute(args, cli.output).await,
         Commands::Data(args) => {
             commands::data::execute(
                 &polymarket_client_sdk::data::Client::default(),

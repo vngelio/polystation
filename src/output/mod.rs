@@ -2,6 +2,7 @@ pub mod approve;
 pub mod bridge;
 pub mod clob;
 pub mod comments;
+pub mod copy;
 pub mod ctf;
 pub mod data;
 pub mod events;
