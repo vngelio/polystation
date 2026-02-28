@@ -247,8 +247,13 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
                 .ok_or_else(|| anyhow!("movement not found: {}", settle.movement_id))?;
             movement.settled = true;
             movement.pnl = settle.pnl;
+            let movement_for_log = movement.clone();
             save_state(&state)?;
-            settle_db_movement(current_mode_from_disk(), &settle.movement_id, settle.pnl)?;
+            let mode = current_mode_from_disk();
+            settle_db_movement(mode, &settle.movement_id, settle.pnl)?;
+            if let Err(e) = append_settlement_log(mode, &movement_for_log) {
+                eprintln!("warning: could not append settlement log: {e}");
+            }
             if matches!(output, OutputFormat::Json) {
                 crate::output::print_json(&serde_json::json!({"status": "settled"}))?;
             } else {
@@ -294,6 +299,7 @@ struct UiStateResponse {
     available_to_copy: Decimal,
     daily_pnl: Vec<(String, Decimal)>,
     historical_pnl: Vec<(String, Decimal)>,
+    recent_movements: Vec<DbMovement>,
 }
 
 #[derive(Serialize)]
@@ -302,7 +308,7 @@ struct UpdatesResponse {
     movements: Vec<DbMovement>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct DbMovement {
     id: i64,
     movement_id: String,
@@ -397,6 +403,11 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
             let current_equity = initial_allocated_funds + settled_pnl;
             let available_to_copy = (current_equity - used_exposure).max(Decimal::ZERO);
 
+            let (_, mut recent_rows) = db_updates_since(mode, 0)?;
+            if recent_rows.len() > 300 {
+                recent_rows = recent_rows[recent_rows.len().saturating_sub(300)..].to_vec();
+            }
+
             let payload = serde_json::to_string(&UiStateResponse {
                 configured: runtime.config.is_some(),
                 monitoring: runtime.monitoring,
@@ -422,6 +433,7 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
                 available_to_copy,
                 daily_pnl: daily_pnl_series(&db_state.movements),
                 historical_pnl: cumulative_pnl_series(&db_state.movements),
+                recent_movements: recent_rows,
             })?;
             write_response(&mut stream, "200 OK", "application/json", &payload)?;
         }
@@ -649,6 +661,9 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                         ),
                     );
                     settle_db_movement(StorageMode::Real, &movement.movement_id, movement.pnl)?;
+                    if let Err(e) = append_settlement_log(StorageMode::Real, &movement) {
+                        log_copy_event("real", format!("error escribiendo log de settlement: {e}"));
+                    }
                 }
             }
         }
@@ -918,6 +933,9 @@ async fn simulation_step(
                     ),
                 );
                 settle_db_movement(StorageMode::Simulation, &movement.movement_id, movement.pnl)?;
+                if let Err(e) = append_settlement_log(StorageMode::Simulation, &movement) {
+                    log_copy_event("sim", format!("error escribiendo log de settlement: {e}"));
+                }
             }
         }
     }
@@ -1364,6 +1382,36 @@ fn config_path() -> Result<PathBuf> {
 
 fn state_path() -> Result<PathBuf> {
     Ok(base_dir()?.join("copy_trader_state.json"))
+}
+
+fn settlement_log_path() -> Result<PathBuf> {
+    Ok(base_dir()?.join("copy_trader_settlements.log"))
+}
+
+fn append_settlement_log(mode: StorageMode, movement: &MovementRecord) -> Result<()> {
+    let path = settlement_log_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let line = format!(
+        "{}	mode={}	movement_id={}	market={}	copied_value={}	pnl={}
+",
+        Utc::now().to_rfc3339(),
+        match mode {
+            StorageMode::Real => "real",
+            StorageMode::Simulation => "sim",
+        },
+        movement.movement_id,
+        movement.market,
+        movement.copied_value,
+        movement.pnl,
+    );
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    f.write_all(line.as_bytes())?;
+    Ok(())
 }
 
 fn db_path(mode: StorageMode) -> Result<PathBuf> {

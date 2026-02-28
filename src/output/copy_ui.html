@@ -349,7 +349,7 @@ input[type=number] { -moz-appearance: textfield; appearance: textfield; }
 .status-cell-hint { font-size: 10px; color: var(--text-dim); letter-spacing: 1px; }
 
 /* ── CHARTS ── */
-.chart-block { border-right: 1px solid var(--border); flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.chart-block { border-right: 1px solid var(--border); flex: 1; display: flex; flex-direction: column; min-height: 180px; min-width: 0; resize: both; overflow: auto; }
 .chart-block:last-child { border-right: none; }
 .chart-header {
   display: flex; align-items: center; justify-content: space-between;
@@ -369,7 +369,7 @@ canvas { display: block; width: 100%; flex: 1; min-height: 0; }
 .log-title { font-size: 10px; letter-spacing: 3px; color: var(--text-dim); text-transform: uppercase; }
 .log-count { font-size: 11px; color: var(--green-dim); letter-spacing: 1px; }
 .table-wrap { overflow-y: auto; flex: 1; min-height: 0; }
-table { border-collapse: collapse; width: 100%; }
+table { border-collapse: collapse; width: 100%; table-layout: fixed; }
 thead tr { background: var(--panel2); position: sticky; top: 0; z-index: 5; }
 th {
   font-family: 'IBM Plex Mono', monospace; font-size: 10px;
@@ -388,6 +388,14 @@ td.mkt { color: var(--cyan); max-width: 180px; overflow: hidden; text-overflow: 
 td.pos { color: var(--green); font-weight: 700; }
 td.neg { color: var(--red); font-weight: 700; }
 td.ts  { color: var(--text-dim); font-size: 11px; }
+
+th { position: relative; }
+.th-resizer {
+  position: absolute; top: 0; right: 0; width: 6px; height: 100%;
+  cursor: col-resize; user-select: none;
+  border-right: 1px dotted rgba(93,255,149,0.25);
+}
+.th-resizer:hover { border-right-color: var(--green); }
 
 /* ── SCROLLBAR ── */
 ::-webkit-scrollbar { width: 4px; height: 4px; }
@@ -619,8 +627,8 @@ td.ts  { color: var(--text-dim); font-size: 11px; }
       <table>
         <thead>
           <tr>
-            <th>Hora</th><th>Mercado</th><th>Leader $</th>
-            <th>Copiado $</th><th>Settled</th><th>PnL</th>
+            <th>Hora</th><th>ID mov.</th><th>Mercado</th><th>Leader $</th>
+            <th>Invertido $</th><th>Diff %</th><th>Settled</th><th>PnL</th>
           </tr>
         </thead>
         <tbody id="moves"></tbody>
@@ -791,6 +799,8 @@ document.getElementById('buildStamp').textContent = 'BUILD ' + Date.now().toStri
 
 // ── STATE ──────────────────────────────────────
 let latest = 0, mode = 'real', localModeDirty = false, pollDirty = false, configDirty = false, moveCount = 0;
+let lastDailySeries = [];
+let lastHistoricalSeries = [];
 
 const toNum = (v) => {
   const n = Number(v);
@@ -927,17 +937,36 @@ async function configure(){
 async function startCopy(){ await api('/api/start',{method:'POST'}); await fullRefresh(); }
 async function stopCopy(){  await api('/api/stop', {method:'POST'}); await fullRefresh(); }
 
+function rowHtml(m){
+  const pnl = parseFloat(m.pnl);
+  const pc = !isNaN(pnl) ? (pnl >= 0 ? 'pos' : 'neg') : '';
+  const mid = String(m.movement_id||'').slice(0,10);
+  const settledTxt = m.settled ? 'true' : 'false';
+  return `<td class="ts">${m.timestamp}</td><td>${mid}</td><td class="mkt">${m.market}</td><td>${m.leader_value}</td><td>${m.copied_value}</td><td>${m.diff_pct}</td><td>${settledTxt}</td><td class="${pc}">${m.pnl}</td>`;
+}
+
 function prependMove(m){
   const tbody = document.getElementById('moves');
-  const tr    = document.createElement('tr');
-  const pnl   = parseFloat(m.pnl);
-  const pc    = !isNaN(pnl) ? (pnl >= 0 ? 'pos' : 'neg') : '';
-  tr.innerHTML = `<td class="ts">${m.timestamp}</td><td class="mkt">${m.market}</td><td>${m.leader_value}</td><td>${m.copied_value}</td><td>${m.settled}</td><td class="${pc}">${m.pnl}</td>`;
+  const tr = document.createElement('tr');
+  tr.innerHTML = rowHtml(m);
   tbody.prepend(tr);
   while(tbody.children.length > 300) tbody.removeChild(tbody.lastChild);
-  moveCount++;
+  moveCount = Math.max(moveCount + 1, tbody.children.length);
   document.getElementById('movCountBadge').textContent = moveCount + ' registros';
   document.getElementById('topMovCount').textContent   = moveCount;
+}
+
+function renderMoves(rows){
+  const tbody = document.getElementById('moves');
+  tbody.innerHTML = '';
+  const list = (rows||[]).slice().reverse();
+  list.forEach((m)=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = rowHtml(m);
+    tbody.appendChild(tr);
+  });
+  moveCount = list.length;
+  document.getElementById('movCountBadge').textContent = moveCount + ' registros';
 }
 
 function drawChart(id, series, lineColor, fillColor, badgeId){
@@ -1065,8 +1094,11 @@ async function fullRefresh(){
       saveDraft();
     }
     toggleRealtime();
-    drawChart('dailyChart',      s.daily_pnl||[],      '#5dff95','rgba(93,255,149,0.14)','dailyLast');
-    drawChart('historicalChart', s.historical_pnl||[], '#20eeff','rgba(32,238,255,0.10)', 'histLast');
+    renderMoves(s.recent_movements||[]);
+    lastDailySeries = s.daily_pnl||[];
+    lastHistoricalSeries = s.historical_pnl||[];
+    drawChart('dailyChart',      lastDailySeries,      '#5dff95','rgba(93,255,149,0.14)','dailyLast');
+    drawChart('historicalChart', lastHistoricalSeries, '#20eeff','rgba(32,238,255,0.10)', 'histLast');
   }catch(e){
     document.getElementById('sysStatus').textContent='ERROR';
     document.getElementById('sysStatus').className='status-cell-val r';
@@ -1074,18 +1106,44 @@ async function fullRefresh(){
   }
 }
 
+function enableColumnResize(){
+  document.querySelectorAll('thead th').forEach((th)=>{
+    th.style.width = th.offsetWidth + 'px';
+    const handle = document.createElement('span');
+    handle.className = 'th-resizer';
+    th.appendChild(handle);
+    let startX=0,startW=0;
+    handle.addEventListener('mousedown',(e)=>{
+      e.preventDefault();
+      startX=e.clientX; startW=th.offsetWidth;
+      const onMove=(ev)=>{ th.style.width = Math.max(70, startW + (ev.clientX-startX)) + 'px'; };
+      const onUp=()=>{ document.removeEventListener('mousemove',onMove); document.removeEventListener('mouseup',onUp); };
+      document.addEventListener('mousemove',onMove);
+      document.addEventListener('mouseup',onUp);
+    });
+  });
+}
+
+const chartResizeObserver = new ResizeObserver(()=>{
+  drawChart('dailyChart',      lastDailySeries,'#5dff95','rgba(93,255,149,0.14)','dailyLast');
+  drawChart('historicalChart', lastHistoricalSeries,'#20eeff','rgba(32,238,255,0.10)', 'histLast');
+});
+document.querySelectorAll('.chart-block').forEach(el=>chartResizeObserver.observe(el));
+
+enableColumnResize();
+
 setInterval(pollUpdates, 500);
 setInterval(fullRefresh, 4000);
 window.addEventListener('resize',()=>{
-  drawChart('dailyChart',      [],'#5dff95','rgba(93,255,149,0.14)','dailyLast');
-  drawChart('historicalChart', [],'#20eeff','rgba(32,238,255,0.10)', 'histLast');
+  drawChart('dailyChart',      lastDailySeries,'#5dff95','rgba(93,255,149,0.14)','dailyLast');
+  drawChart('historicalChart', lastHistoricalSeries,'#20eeff','rgba(32,238,255,0.10)', 'histLast');
 });
 loadDraft();
 bindDraftPersistence();
 toggleRealtime();
 setTimeout(()=>{
-  drawChart('dailyChart',      [],'#5dff95','rgba(93,255,149,0.14)','dailyLast');
-  drawChart('historicalChart', [],'#20eeff','rgba(32,238,255,0.10)', 'histLast');
+  drawChart('dailyChart',      lastDailySeries,'#5dff95','rgba(93,255,149,0.14)','dailyLast');
+  drawChart('historicalChart', lastHistoricalSeries,'#20eeff','rgba(32,238,255,0.10)', 'histLast');
 }, 100);
 </script>
 </body>
