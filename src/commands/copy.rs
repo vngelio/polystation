@@ -150,6 +150,8 @@ pub struct MovementRecord {
     pub copy_side: String,
     #[serde(default)]
     pub outcome: String,
+    #[serde(default)]
+    pub resolved_outcome: String,
     pub diff_pct: Decimal,
     #[serde(default)]
     pub estimated_total_fee_usd: Decimal,
@@ -278,6 +280,7 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
                 quantity: Decimal::ZERO,
                 copy_side: "unknown".to_string(),
                 outcome: String::new(),
+                resolved_outcome: String::new(),
                 diff_pct: record.diff_pct,
                 estimated_total_fee_usd: Decimal::ZERO,
                 settled: false,
@@ -381,6 +384,8 @@ struct DbMovement {
     copy_side: String,
     #[serde(default)]
     outcome: String,
+    #[serde(default)]
+    resolved_outcome: String,
     diff_pct: String,
     #[serde(default)]
     estimated_total_fee_usd: String,
@@ -985,10 +990,11 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 leader_value: t.size * t.price,
                 leader_price: t.price,
                 copied_value: plan.capped_size,
-                simulated_copy_price: estimated_sim_price.unwrap_or(t.price),
+                simulated_copy_price: estimated_sim_price.unwrap_or(Decimal::ZERO),
                 quantity: t.size,
                 copy_side: t.side.to_string(),
                 outcome: t.outcome.clone(),
+                resolved_outcome: String::new(),
                 diff_pct: Decimal::ZERO,
                 estimated_total_fee_usd: fee_impact
                     .map(|x| x.round_trip_fee_usd)
@@ -1341,10 +1347,11 @@ async fn simulation_step(
             leader_value: t.size * t.price,
             leader_price: t.price,
             copied_value: plan.capped_size,
-            simulated_copy_price: estimated_sim_price.unwrap_or(t.price),
+            simulated_copy_price: estimated_sim_price.unwrap_or(Decimal::ZERO),
             quantity: t.size,
             copy_side: t.side.to_string(),
             outcome: t.outcome.clone(),
+            resolved_outcome: String::new(),
             diff_pct: Decimal::ZERO,
             estimated_total_fee_usd: fee_impact
                 .map(|x| x.round_trip_fee_usd)
@@ -1720,7 +1727,7 @@ fn settle_open_movements_from_closed_positions(
     state: &mut CopyState,
     closed_positions: &[polymarket_client_sdk::data::types::response::ClosedPosition],
 ) -> Vec<MovementRecord> {
-    let mut by_slug: HashMap<String, VecDeque<(i64, Decimal)>> = HashMap::new();
+    let mut by_slug: HashMap<String, VecDeque<(i64, Decimal, String)>> = HashMap::new();
     let mut closed_sorted = closed_positions.to_vec();
     closed_sorted.sort_by_key(|c| c.timestamp);
 
@@ -1730,15 +1737,17 @@ fn settle_open_movements_from_closed_positions(
         }
         let roi = closed.realized_pnl / closed.total_bought;
         let normalized = normalize_market_slug(&closed.slug);
-        by_slug
-            .entry(closed.slug.clone())
-            .or_default()
-            .push_back((closed.timestamp, roi));
+        by_slug.entry(closed.slug.clone()).or_default().push_back((
+            closed.timestamp,
+            roi,
+            closed.outcome.clone(),
+        ));
         if normalized != closed.slug {
-            by_slug
-                .entry(normalized)
-                .or_default()
-                .push_back((closed.timestamp, roi));
+            by_slug.entry(normalized).or_default().push_back((
+                closed.timestamp,
+                roi,
+                closed.outcome.clone(),
+            ));
         }
     }
 
@@ -1750,23 +1759,26 @@ fn settle_open_movements_from_closed_positions(
             continue;
         };
 
-        let mut pop_eligible_roi = |q: &mut VecDeque<(i64, Decimal)>| {
+        let mut pop_eligible_roi = |q: &mut VecDeque<(i64, Decimal, String)>| {
             if q.is_empty() {
                 return None;
             }
 
             // Prefer closures with usable timestamps that are >= movement timestamp,
             // or closures with unknown timestamp (0) which we consider usable.
-            if let Some(idx) = q.iter().position(|(ts, _)| *ts == 0 || *ts >= movement_ts) {
-                return q.remove(idx).map(|(_, roi)| roi);
+            if let Some(idx) = q
+                .iter()
+                .position(|(ts, _, _)| *ts == 0 || *ts >= movement_ts)
+            {
+                return q.remove(idx).map(|(_, roi, outcome)| (roi, outcome));
             }
 
             // Fallback: some Data API responses can carry stale/legacy timestamps.
             // In that case, consume oldest closure to avoid movements stuck forever.
-            q.pop_front().map(|(_, roi)| roi)
+            q.pop_front().map(|(_, roi, outcome)| (roi, outcome))
         };
 
-        let roi = by_slug
+        let roi_and_outcome = by_slug
             .get_mut(movement.market.as_str())
             .and_then(&mut pop_eligible_roi)
             .or_else(|| {
@@ -1775,11 +1787,12 @@ fn settle_open_movements_from_closed_positions(
                     .and_then(&mut pop_eligible_roi)
             });
 
-        let Some(roi) = roi else {
+        let Some((roi, resolved_outcome)) = roi_and_outcome else {
             continue;
         };
 
         movement.pnl = movement.copied_value * roi;
+        movement.resolved_outcome = resolved_outcome;
         movement.settled = true;
         settled.push(movement.clone());
     }
@@ -1810,7 +1823,7 @@ fn append_settlement_log(mode: StorageMode, movement: &MovementRecord) -> Result
         fs::create_dir_all(parent)?;
     }
     let line = format!(
-        "{}\tmode={}\tmovement_id={}\tmarket={}\tside={}\toutcome={}\tleader_price={}\tsimulated_copy_price={}\tquantity={}\tcopied_value={}\testimated_total_fee_usd={}\tpnl={}\n",
+        "{}\tmode={}\tmovement_id={}\tmarket={}\tside={}\toutcome={}\tresolved_outcome={}\tleader_price={}\tsimulated_copy_price={}\tquantity={}\tcopied_value={}\testimated_total_fee_usd={}\tpnl={}\n",
         Utc::now().to_rfc3339(),
         match mode {
             StorageMode::Real => "real",
@@ -1820,6 +1833,7 @@ fn append_settlement_log(mode: StorageMode, movement: &MovementRecord) -> Result
         movement.market,
         movement.copy_side,
         movement.outcome,
+        movement.resolved_outcome,
         movement.leader_price,
         movement.simulated_copy_price,
         movement.quantity,
@@ -1904,6 +1918,8 @@ struct DbRow {
     copy_side: String,
     #[serde(default)]
     outcome: String,
+    #[serde(default)]
+    resolved_outcome: String,
     diff_pct: String,
     #[serde(default)]
     estimated_total_fee_usd: String,
@@ -1955,6 +1971,7 @@ fn append_db_movement(mode: StorageMode, m: &MovementRecord) -> Result<()> {
         quantity: m.quantity.to_string(),
         copy_side: m.copy_side.clone(),
         outcome: m.outcome.clone(),
+        resolved_outcome: m.resolved_outcome.clone(),
         diff_pct: m.diff_pct.to_string(),
         estimated_total_fee_usd: m.estimated_total_fee_usd.to_string(),
         settled: m.settled,
@@ -1990,6 +2007,7 @@ fn load_state_from_db(mode: StorageMode) -> Result<CopyState> {
             quantity: Decimal::from_str_exact(&r.quantity).unwrap_or(Decimal::ZERO),
             copy_side: r.copy_side,
             outcome: r.outcome,
+            resolved_outcome: r.resolved_outcome,
             diff_pct: Decimal::from_str_exact(&r.diff_pct).unwrap_or(Decimal::ZERO),
             estimated_total_fee_usd: Decimal::from_str_exact(&r.estimated_total_fee_usd)
                 .unwrap_or(Decimal::ZERO),
@@ -2019,6 +2037,7 @@ fn db_updates_since(mode: StorageMode, since: i64) -> Result<(i64, Vec<DbMovemen
             quantity: r.quantity,
             copy_side: r.copy_side,
             outcome: r.outcome,
+            resolved_outcome: r.resolved_outcome,
             diff_pct: r.diff_pct,
             estimated_total_fee_usd: r.estimated_total_fee_usd,
             settled: r.settled,
@@ -2141,6 +2160,7 @@ mod tests {
                 quantity: Decimal::ZERO,
                 copy_side: "unknown".into(),
                 outcome: String::new(),
+                resolved_outcome: String::new(),
                 diff_pct: Decimal::ZERO,
                 estimated_total_fee_usd: Decimal::ZERO,
                 settled: false,
@@ -2199,6 +2219,7 @@ mod tests {
                     quantity: d("10"),
                     copy_side: "buy".into(),
                     outcome: "Yes".into(),
+                    resolved_outcome: String::new(),
                     diff_pct: Decimal::ZERO,
                     estimated_total_fee_usd: Decimal::ZERO,
                     settled: false,
@@ -2215,6 +2236,7 @@ mod tests {
                     quantity: d("4"),
                     copy_side: "sell".into(),
                     outcome: "Yes".into(),
+                    resolved_outcome: String::new(),
                     diff_pct: Decimal::ZERO,
                     estimated_total_fee_usd: Decimal::ZERO,
                     settled: false,
@@ -2282,6 +2304,7 @@ mod tests {
                 quantity: "0".into(),
                 copy_side: "unknown".into(),
                 outcome: String::new(),
+                resolved_outcome: String::new(),
                 diff_pct: "0".into(),
                 estimated_total_fee_usd: "0".into(),
                 settled: false,
@@ -2299,6 +2322,7 @@ mod tests {
                 quantity: "0".into(),
                 copy_side: "unknown".into(),
                 outcome: String::new(),
+                resolved_outcome: String::new(),
                 diff_pct: "0".into(),
                 estimated_total_fee_usd: "0".into(),
                 settled: true,
@@ -2316,6 +2340,7 @@ mod tests {
                 quantity: "0".into(),
                 copy_side: "unknown".into(),
                 outcome: String::new(),
+                resolved_outcome: String::new(),
                 diff_pct: "0".into(),
                 estimated_total_fee_usd: "0".into(),
                 settled: false,
@@ -2345,6 +2370,7 @@ mod tests {
                     quantity: Decimal::ZERO,
                     copy_side: "unknown".into(),
                     outcome: String::new(),
+                    resolved_outcome: String::new(),
                     diff_pct: Decimal::ZERO,
                     estimated_total_fee_usd: Decimal::ZERO,
                     settled: false,
@@ -2361,6 +2387,7 @@ mod tests {
                     quantity: Decimal::ZERO,
                     copy_side: "unknown".into(),
                     outcome: String::new(),
+                    resolved_outcome: String::new(),
                     diff_pct: Decimal::ZERO,
                     estimated_total_fee_usd: Decimal::ZERO,
                     settled: false,
@@ -2433,6 +2460,7 @@ mod tests {
                 quantity: Decimal::ZERO,
                 copy_side: "buy".into(),
                 outcome: "Yes".into(),
+                resolved_outcome: String::new(),
                 diff_pct: Decimal::ZERO,
                 estimated_total_fee_usd: Decimal::ZERO,
                 settled: false,
@@ -2485,6 +2513,7 @@ mod tests {
                 quantity: Decimal::ZERO,
                 copy_side: "buy".into(),
                 outcome: "Yes".into(),
+                resolved_outcome: String::new(),
                 diff_pct: Decimal::ZERO,
                 estimated_total_fee_usd: Decimal::ZERO,
                 settled: false,
@@ -2537,6 +2566,7 @@ mod tests {
                 quantity: Decimal::ZERO,
                 copy_side: "buy".into(),
                 outcome: "Yes".into(),
+                resolved_outcome: String::new(),
                 diff_pct: Decimal::ZERO,
                 estimated_total_fee_usd: Decimal::ZERO,
                 settled: false,

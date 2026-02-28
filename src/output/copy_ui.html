@@ -629,7 +629,7 @@ th { position: relative; }
         <thead>
           <tr>
             <th>Hora</th><th>ID mov.</th><th>Mercado</th><th>Lado</th><th>Outcome</th><th>Leader $</th><th>Px leader</th>
-            <th>Invertido $</th><th>Px sim/cop</th><th>Cantidad</th><th>Fees $</th><th>Diff %</th><th>Settled</th><th>PnL bruto</th><th>Resultado final</th>
+            <th>Invertido $</th><th>Px sim/cop</th><th>Cantidad</th><th>Fees $</th><th>Settled</th><th>Resultado apuesta</th><th>PnL bruto</th><th>Resultado final</th>
           </tr>
         </thead>
         <tbody id="moves"></tbody>
@@ -954,7 +954,10 @@ function rowHtml(m){
   const netClass = isSettled ? (net >= 0 ? 'pos' : 'neg') : '';
   const netTxt = isSettled ? `${net >= 0 ? '+' : ''}${net.toFixed(6)}` : '—';
   const feesTxt = !isNaN(fees) ? fees.toString() : (m.estimated_total_fee_usd || '0');
-  return `<td class="ts">${m.timestamp}</td><td>${mid}</td><td class="mkt">${m.market}</td><td>${m.copy_side||"unknown"}</td><td>${m.outcome||"—"}</td><td>${m.leader_value}</td><td>${m.leader_price||"0"}</td><td>${m.copied_value}</td><td>${m.simulated_copy_price||"0"}</td><td>${m.quantity||"0"}</td><td>${feesTxt}</td><td>${m.diff_pct}</td><td>${settledTxt}</td><td class="${grossClass}">${m.pnl}</td><td class="${netClass}">${netTxt}</td>`;
+  const copyPx = parseFloat(m.simulated_copy_price || '0');
+  const copyPxTxt = (!isNaN(copyPx) && copyPx > 0) ? (m.simulated_copy_price) : '—';
+  const resolvedOutcome = isSettled ? (m.resolved_outcome || m.outcome || '—') : '—';
+  return `<td class="ts">${m.timestamp}</td><td>${mid}</td><td class="mkt">${m.market}</td><td>${m.copy_side||"unknown"}</td><td>${m.outcome||"—"}</td><td>${m.leader_value}</td><td>${m.leader_price||"0"}</td><td>${m.copied_value}</td><td>${copyPxTxt}</td><td>${m.quantity||"0"}</td><td>${feesTxt}</td><td>${settledTxt}</td><td>${resolvedOutcome}</td><td class="${grossClass}">${m.pnl}</td><td class="${netClass}">${netTxt}</td>`;
 }
 
 function prependMove(m){
@@ -1027,7 +1030,12 @@ function drawChart(id, series, lineColor, fillColor, badgeId){
   mn -= padY;
   mx += padY;
 
-  const xTimes = points.map(p=>new Date(p.x).getTime());
+  const parseTime = (x)=>{
+    if (typeof x === 'number') return x;
+    const t = Date.parse(String(x));
+    return Number.isFinite(t) ? t : NaN;
+  };
+  const xTimes = points.map(p=>parseTime(p.x));
   const hasChronoAxis = xTimes.length > 1 && xTimes.every(t=>Number.isFinite(t));
   const minX = hasChronoAxis ? Math.min(...xTimes) : 0;
   const maxX = hasChronoAxis ? Math.max(...xTimes) : Math.max(1, vals.length-1);
