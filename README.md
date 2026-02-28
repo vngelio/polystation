@@ -468,11 +468,13 @@ Flujo operativo de cada modo:
    - Consulta valor de posiciones del líder + últimas operaciones.
    - Deduplica por hash de transacción para evitar replays.
    - Calcula tamaño a copiar con la misma función de riesgo (proporcional por fondos asignados + caps de trade/exposición + mínimo en USD).
+   - Bloquea copias `SELL` si no hay inventario comprado abierto suficiente (no permite vender algo no comprado antes).
    - Persiste cada movimiento copiado en el historial real.
 2. **Modo simulación**
    - Consulta trades y cierres reales del líder en cada tick.
    - Reutiliza exactamente la misma función de sizing/riesgo que en real.
    - Verifica liquidez en order book antes de registrar movimientos `sim-*`.
+   - Bloquea simulaciones `SELL` si no hay inventario comprado abierto suficiente.
    - Calcula settle/PnL usando cierres reales del líder; para equity aplica ajuste de fees en mercados rápidos (`5m`/`15m`).
 
 ### Other

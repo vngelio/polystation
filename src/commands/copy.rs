@@ -860,6 +860,21 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 continue;
             }
 
+            if t.side.to_string().eq_ignore_ascii_case("sell") {
+                let required_sell_shares = copied_shares_from_notional(plan.capped_size, t.price);
+                if !has_enough_inventory_for_sell(&state, &t.slug, &t.outcome, required_sell_shares)
+                {
+                    log_copy_event(
+                        "real",
+                        format!(
+                            "sell {} ({}) descartado: no hay inventario comprado suficiente (outcome={}, required_shares={})",
+                            t.slug, tx_hash, t.outcome, required_sell_shares
+                        ),
+                    );
+                    continue;
+                }
+            }
+
             let fee_impact = trading_fee_impact_for_movement(&t.slug, plan.capped_size);
             if let Some(impact) = fee_impact
                 && impact.max_net_profit_usd <= Decimal::ZERO
@@ -1200,6 +1215,20 @@ async fn simulation_step(
             continue;
         }
 
+        if t.side.to_string().eq_ignore_ascii_case("sell") {
+            let required_sell_shares = copied_shares_from_notional(plan.capped_size, t.price);
+            if !has_enough_inventory_for_sell(&state, &t.slug, &t.outcome, required_sell_shares) {
+                log_copy_event(
+                    "sim",
+                    format!(
+                        "simulacion sell descartada {} ({}): no hay inventario comprado suficiente (outcome={}, required_shares={})",
+                        t.slug, tx_hash, t.outcome, required_sell_shares
+                    ),
+                );
+                continue;
+            }
+        }
+
         let fee_impact = trading_fee_impact_for_movement(&t.slug, plan.capped_size);
         if let Some(impact) = fee_impact
             && impact.max_net_profit_usd <= Decimal::ZERO
@@ -1529,6 +1558,51 @@ fn validate_config(cfg: &ConfigureArgs) -> Result<()> {
         bail!("poll-interval-ms too low for selected mode");
     }
     Ok(())
+}
+
+fn copied_shares_from_notional(notional_usd: Decimal, price: Decimal) -> Decimal {
+    if notional_usd <= Decimal::ZERO || price <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    notional_usd / price
+}
+
+fn movement_copied_shares(m: &MovementRecord) -> Decimal {
+    let px = if m.simulated_copy_price > Decimal::ZERO {
+        m.simulated_copy_price
+    } else {
+        m.leader_price
+    };
+    copied_shares_from_notional(m.copied_value, px)
+}
+
+fn has_enough_inventory_for_sell(
+    state: &CopyState,
+    market: &str,
+    outcome: &str,
+    required_sell_shares: Decimal,
+) -> bool {
+    if required_sell_shares <= Decimal::ZERO {
+        return false;
+    }
+
+    let mut net_long_shares = Decimal::ZERO;
+    for movement in state.movements.iter().filter(|m| !m.settled) {
+        if movement.market != market || movement.outcome != outcome {
+            continue;
+        }
+        let shares = movement_copied_shares(movement);
+        if shares <= Decimal::ZERO {
+            continue;
+        }
+        if movement.copy_side.eq_ignore_ascii_case("buy") {
+            net_long_shares += shares;
+        } else if movement.copy_side.eq_ignore_ascii_case("sell") {
+            net_long_shares -= shares;
+        }
+    }
+
+    net_long_shares >= required_sell_shares
 }
 
 fn compute_plan(
@@ -2050,6 +2124,66 @@ mod tests {
         let p = compute_plan(&cfg, &state, d("1000"), d("100")).unwrap();
         assert_eq!(p.capped_size, d("50"));
         assert_eq!(p.available_funds, d("50"));
+    }
+
+    #[test]
+    fn sell_requires_previous_open_buy_inventory() {
+        let state = CopyState {
+            movements: vec![
+                MovementRecord {
+                    movement_id: "b1".into(),
+                    market: "eth-updown-5m-1772281500".into(),
+                    timestamp: "2026-02-28T12:00:00Z".into(),
+                    leader_value: d("10"),
+                    leader_price: d("0.4"),
+                    copied_value: d("4"),
+                    simulated_copy_price: d("0.4"),
+                    quantity: d("10"),
+                    copy_side: "buy".into(),
+                    outcome: "Yes".into(),
+                    diff_pct: Decimal::ZERO,
+                    estimated_total_fee_usd: Decimal::ZERO,
+                    settled: false,
+                    pnl: Decimal::ZERO,
+                },
+                MovementRecord {
+                    movement_id: "s1".into(),
+                    market: "eth-updown-5m-1772281500".into(),
+                    timestamp: "2026-02-28T12:01:00Z".into(),
+                    leader_value: d("4"),
+                    leader_price: d("0.5"),
+                    copied_value: d("2"),
+                    simulated_copy_price: d("0.5"),
+                    quantity: d("4"),
+                    copy_side: "sell".into(),
+                    outcome: "Yes".into(),
+                    diff_pct: Decimal::ZERO,
+                    estimated_total_fee_usd: Decimal::ZERO,
+                    settled: false,
+                    pnl: Decimal::ZERO,
+                },
+            ],
+        };
+
+        // Remaining inventory: 10 - 4 = 6 shares.
+        assert!(has_enough_inventory_for_sell(
+            &state,
+            "eth-updown-5m-1772281500",
+            "Yes",
+            d("5"),
+        ));
+        assert!(!has_enough_inventory_for_sell(
+            &state,
+            "eth-updown-5m-1772281500",
+            "Yes",
+            d("7"),
+        ));
+        assert!(!has_enough_inventory_for_sell(
+            &state,
+            "eth-updown-5m-1772281500",
+            "No",
+            d("1"),
+        ));
     }
 
     #[test]

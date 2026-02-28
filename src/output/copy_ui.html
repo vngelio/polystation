@@ -629,7 +629,7 @@ th { position: relative; }
         <thead>
           <tr>
             <th>Hora</th><th>ID mov.</th><th>Mercado</th><th>Lado</th><th>Outcome</th><th>Leader $</th><th>Px leader</th>
-            <th>Invertido $</th><th>Px sim/cop</th><th>Cantidad</th><th>Diff %</th><th>Settled</th><th>PnL</th>
+            <th>Invertido $</th><th>Px sim/cop</th><th>Cantidad</th><th>Fees $</th><th>Diff %</th><th>Settled</th><th>PnL bruto</th><th>Resultado final</th>
           </tr>
         </thead>
         <tbody id="moves"></tbody>
@@ -945,10 +945,16 @@ async function stopCopy(){  await api('/api/stop', {method:'POST'}); await fullR
 
 function rowHtml(m){
   const pnl = parseFloat(m.pnl);
-  const pc = !isNaN(pnl) ? (pnl >= 0 ? 'pos' : 'neg') : '';
+  const fees = parseFloat(m.estimated_total_fee_usd || '0');
+  const grossClass = !isNaN(pnl) ? (pnl >= 0 ? 'pos' : 'neg') : '';
   const mid = String(m.movement_id||'').slice(0,10);
   const settledTxt = m.settled ? 'true' : 'false';
-  return `<td class="ts">${m.timestamp}</td><td>${mid}</td><td class="mkt">${m.market}</td><td>${m.copy_side||"unknown"}</td><td>${m.outcome||"—"}</td><td>${m.leader_value}</td><td>${m.leader_price||"0"}</td><td>${m.copied_value}</td><td>${m.simulated_copy_price||"0"}</td><td>${m.quantity||"0"}</td><td>${m.diff_pct}</td><td>${settledTxt}</td><td class="${pc}">${m.pnl}</td>`;
+  const isSettled = settledTxt === 'true';
+  const net = (isNaN(pnl) ? 0 : pnl) - (isNaN(fees) ? 0 : fees);
+  const netClass = isSettled ? (net >= 0 ? 'pos' : 'neg') : '';
+  const netTxt = isSettled ? `${net >= 0 ? '+' : ''}${net.toFixed(6)}` : '—';
+  const feesTxt = !isNaN(fees) ? fees.toString() : (m.estimated_total_fee_usd || '0');
+  return `<td class="ts">${m.timestamp}</td><td>${mid}</td><td class="mkt">${m.market}</td><td>${m.copy_side||"unknown"}</td><td>${m.outcome||"—"}</td><td>${m.leader_value}</td><td>${m.leader_price||"0"}</td><td>${m.copied_value}</td><td>${m.simulated_copy_price||"0"}</td><td>${m.quantity||"0"}</td><td>${feesTxt}</td><td>${m.diff_pct}</td><td>${settledTxt}</td><td class="${grossClass}">${m.pnl}</td><td class="${netClass}">${netTxt}</td>`;
 }
 
 function prependMove(m){
