@@ -151,6 +151,8 @@ pub struct MovementRecord {
     #[serde(default)]
     pub outcome: String,
     pub diff_pct: Decimal,
+    #[serde(default)]
+    pub estimated_total_fee_usd: Decimal,
     pub settled: bool,
     pub pnl: Decimal,
 }
@@ -182,6 +184,38 @@ fn min_poll_ms(realtime_mode: bool, simulation_mode: bool) -> u64 {
 
 fn normalize_poll_ms(poll_ms: u64, realtime_mode: bool, simulation_mode: bool) -> u64 {
     poll_ms.max(min_poll_ms(realtime_mode, simulation_mode))
+}
+
+const FAST_MARKET_FEE_BPS: u32 = 70;
+const BPS_DENOMINATOR: u32 = 10_000;
+
+fn is_fast_market_with_fee(slug: &str) -> bool {
+    let normalized = normalize_market_slug(slug);
+    normalized.contains("-updown-5m") || normalized.contains("-updown-15m")
+}
+
+fn trading_fee_impact_for_movement(
+    market: &str,
+    copied_value: Decimal,
+) -> Option<TradingFeeImpact> {
+    if !is_fast_market_with_fee(market) || copied_value <= Decimal::ZERO {
+        return None;
+    }
+
+    let fee_rate = Decimal::from(FAST_MARKET_FEE_BPS) / Decimal::from(BPS_DENOMINATOR);
+    let entry_fee_usd = copied_value * fee_rate;
+    let round_trip_fee_usd = entry_fee_usd * Decimal::from(2);
+    let max_gross_profit_usd =
+        copied_value * (Decimal::ONE - Decimal::from_i128_with_scale(100, 3));
+    let max_net_profit_usd = max_gross_profit_usd - round_trip_fee_usd;
+
+    Some(TradingFeeImpact {
+        fee_bps: FAST_MARKET_FEE_BPS,
+        entry_fee_usd,
+        round_trip_fee_usd,
+        max_gross_profit_usd,
+        max_net_profit_usd,
+    })
 }
 
 pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
@@ -245,6 +279,7 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
                 copy_side: "unknown".to_string(),
                 outcome: String::new(),
                 diff_pct: record.diff_pct,
+                estimated_total_fee_usd: Decimal::ZERO,
                 settled: false,
                 pnl: Decimal::ZERO,
             };
@@ -347,8 +382,19 @@ struct DbMovement {
     #[serde(default)]
     outcome: String,
     diff_pct: String,
+    #[serde(default)]
+    estimated_total_fee_usd: String,
     settled: bool,
     pnl: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TradingFeeImpact {
+    fee_bps: u32,
+    entry_fee_usd: Decimal,
+    round_trip_fee_usd: Decimal,
+    max_gross_profit_usd: Decimal,
+    max_net_profit_usd: Decimal,
 }
 
 async fn run_ui(ui: UiArgs) -> Result<()> {
@@ -418,11 +464,11 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
                 .as_ref()
                 .map(|c| c.allocated_funds)
                 .unwrap_or(Decimal::ZERO);
-            let settled_pnl: Decimal = db_state
+            let settled_pnl_after_fees: Decimal = db_state
                 .movements
                 .iter()
                 .filter(|m| m.settled)
-                .map(|m| m.pnl)
+                .map(|m| m.pnl - m.estimated_total_fee_usd)
                 .sum();
             let used_exposure: Decimal = db_state
                 .movements
@@ -430,7 +476,7 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
                 .filter(|m| !m.settled)
                 .map(|m| m.copied_value)
                 .sum();
-            let current_equity = initial_allocated_funds + settled_pnl;
+            let current_equity = initial_allocated_funds + settled_pnl_after_fees;
             let available_to_copy = (current_equity - used_exposure).max(Decimal::ZERO);
 
             let (_, mut recent_rows) = db_updates_since(mode, 0)?;
@@ -814,6 +860,26 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 continue;
             }
 
+            let fee_impact = trading_fee_impact_for_movement(&t.slug, plan.capped_size);
+            if let Some(impact) = fee_impact
+                && impact.max_net_profit_usd <= Decimal::ZERO
+            {
+                log_copy_event(
+                    "real",
+                    format!(
+                        "trade {} ({}) descartado por fees ({} bps): profit_max_neto={} (gross_max={} fee_entry={} fees_rt={})",
+                        t.slug,
+                        tx_hash,
+                        impact.fee_bps,
+                        impact.max_net_profit_usd,
+                        impact.max_gross_profit_usd,
+                        impact.entry_fee_usd,
+                        impact.round_trip_fee_usd,
+                    ),
+                );
+                continue;
+            }
+
             log_copy_event(
                 "real",
                 format!(
@@ -888,6 +954,9 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 copy_side: t.side.to_string(),
                 outcome: t.outcome.clone(),
                 diff_pct: Decimal::ZERO,
+                estimated_total_fee_usd: fee_impact
+                    .map(|x| x.round_trip_fee_usd)
+                    .unwrap_or(Decimal::ZERO),
                 settled: false,
                 pnl: Decimal::ZERO,
             };
@@ -1131,6 +1200,26 @@ async fn simulation_step(
             continue;
         }
 
+        let fee_impact = trading_fee_impact_for_movement(&t.slug, plan.capped_size);
+        if let Some(impact) = fee_impact
+            && impact.max_net_profit_usd <= Decimal::ZERO
+        {
+            log_copy_event(
+                "sim",
+                format!(
+                    "simulacion descartada por fees {} ({}) ({} bps): profit_max_neto={} (gross_max={} fee_entry={} fees_rt={})",
+                    t.slug,
+                    tx_hash,
+                    impact.fee_bps,
+                    impact.max_net_profit_usd,
+                    impact.max_gross_profit_usd,
+                    impact.entry_fee_usd,
+                    impact.round_trip_fee_usd,
+                ),
+            );
+            continue;
+        }
+
         log_copy_event(
             "sim",
             format!(
@@ -1207,6 +1296,9 @@ async fn simulation_step(
             copy_side: t.side.to_string(),
             outcome: t.outcome.clone(),
             diff_pct: Decimal::ZERO,
+            estimated_total_fee_usd: fee_impact
+                .map(|x| x.round_trip_fee_usd)
+                .unwrap_or(Decimal::ZERO),
             settled: false,
             pnl: Decimal::ZERO,
         };
@@ -1618,7 +1710,7 @@ fn append_settlement_log(mode: StorageMode, movement: &MovementRecord) -> Result
         fs::create_dir_all(parent)?;
     }
     let line = format!(
-        "{}\tmode={}\tmovement_id={}\tmarket={}\tside={}\toutcome={}\tleader_price={}\tsimulated_copy_price={}\tquantity={}\tcopied_value={}\tpnl={}\n",
+        "{}\tmode={}\tmovement_id={}\tmarket={}\tside={}\toutcome={}\tleader_price={}\tsimulated_copy_price={}\tquantity={}\tcopied_value={}\testimated_total_fee_usd={}\tpnl={}\n",
         Utc::now().to_rfc3339(),
         match mode {
             StorageMode::Real => "real",
@@ -1632,6 +1724,7 @@ fn append_settlement_log(mode: StorageMode, movement: &MovementRecord) -> Result
         movement.simulated_copy_price,
         movement.quantity,
         movement.copied_value,
+        movement.estimated_total_fee_usd,
         movement.pnl,
     );
     let mut f = fs::OpenOptions::new()
@@ -1712,6 +1805,8 @@ struct DbRow {
     #[serde(default)]
     outcome: String,
     diff_pct: String,
+    #[serde(default)]
+    estimated_total_fee_usd: String,
     settled: bool,
     pnl: String,
 }
@@ -1761,6 +1856,7 @@ fn append_db_movement(mode: StorageMode, m: &MovementRecord) -> Result<()> {
         copy_side: m.copy_side.clone(),
         outcome: m.outcome.clone(),
         diff_pct: m.diff_pct.to_string(),
+        estimated_total_fee_usd: m.estimated_total_fee_usd.to_string(),
         settled: m.settled,
         pnl: m.pnl.to_string(),
     });
@@ -1795,6 +1891,8 @@ fn load_state_from_db(mode: StorageMode) -> Result<CopyState> {
             copy_side: r.copy_side,
             outcome: r.outcome,
             diff_pct: Decimal::from_str_exact(&r.diff_pct).unwrap_or(Decimal::ZERO),
+            estimated_total_fee_usd: Decimal::from_str_exact(&r.estimated_total_fee_usd)
+                .unwrap_or(Decimal::ZERO),
             settled: r.settled,
             pnl: Decimal::from_str_exact(&r.pnl).unwrap_or(Decimal::ZERO),
         })
@@ -1822,6 +1920,7 @@ fn db_updates_since(mode: StorageMode, since: i64) -> Result<(i64, Vec<DbMovemen
             copy_side: r.copy_side,
             outcome: r.outcome,
             diff_pct: r.diff_pct,
+            estimated_total_fee_usd: r.estimated_total_fee_usd,
             settled: r.settled,
             pnl: r.pnl,
         })
@@ -1943,6 +2042,7 @@ mod tests {
                 copy_side: "unknown".into(),
                 outcome: String::new(),
                 diff_pct: Decimal::ZERO,
+                estimated_total_fee_usd: Decimal::ZERO,
                 settled: false,
                 pnl: Decimal::ZERO,
             }],
@@ -1950,6 +2050,20 @@ mod tests {
         let p = compute_plan(&cfg, &state, d("1000"), d("100")).unwrap();
         assert_eq!(p.capped_size, d("50"));
         assert_eq!(p.available_funds, d("50"));
+    }
+
+    #[test]
+    fn fast_market_fee_detection_and_impact() {
+        assert!(is_fast_market_with_fee("eth-updown-5m-1772281500"));
+        assert!(is_fast_market_with_fee("btc-updown-15m-1772281500"));
+        assert!(!is_fast_market_with_fee("btc-updown-1h-1772281500"));
+
+        let impact = trading_fee_impact_for_movement("eth-updown-5m-1772281500", d("10")).unwrap();
+        assert_eq!(impact.fee_bps, FAST_MARKET_FEE_BPS);
+        assert_eq!(impact.entry_fee_usd, d("0.07"));
+        assert_eq!(impact.round_trip_fee_usd, d("0.14"));
+        assert_eq!(impact.max_gross_profit_usd, d("9"));
+        assert_eq!(impact.max_net_profit_usd, d("8.86"));
     }
 
     #[test]
@@ -1977,6 +2091,7 @@ mod tests {
                 copy_side: "unknown".into(),
                 outcome: String::new(),
                 diff_pct: "0".into(),
+                estimated_total_fee_usd: "0".into(),
                 settled: false,
                 pnl: "0".into(),
             },
@@ -1993,6 +2108,7 @@ mod tests {
                 copy_side: "unknown".into(),
                 outcome: String::new(),
                 diff_pct: "0".into(),
+                estimated_total_fee_usd: "0".into(),
                 settled: true,
                 pnl: "1".into(),
             },
@@ -2009,6 +2125,7 @@ mod tests {
                 copy_side: "unknown".into(),
                 outcome: String::new(),
                 diff_pct: "0".into(),
+                estimated_total_fee_usd: "0".into(),
                 settled: false,
                 pnl: "0".into(),
             },
@@ -2037,6 +2154,7 @@ mod tests {
                     copy_side: "unknown".into(),
                     outcome: String::new(),
                     diff_pct: Decimal::ZERO,
+                    estimated_total_fee_usd: Decimal::ZERO,
                     settled: false,
                     pnl: Decimal::ZERO,
                 },
@@ -2052,6 +2170,7 @@ mod tests {
                     copy_side: "unknown".into(),
                     outcome: String::new(),
                     diff_pct: Decimal::ZERO,
+                    estimated_total_fee_usd: Decimal::ZERO,
                     settled: false,
                     pnl: Decimal::ZERO,
                 },
@@ -2123,6 +2242,7 @@ mod tests {
                 copy_side: "buy".into(),
                 outcome: "Yes".into(),
                 diff_pct: Decimal::ZERO,
+                estimated_total_fee_usd: Decimal::ZERO,
                 settled: false,
                 pnl: Decimal::ZERO,
             }],
