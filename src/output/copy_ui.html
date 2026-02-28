@@ -377,7 +377,9 @@ th {
   padding: 7px 12px; text-align: left;
   border-bottom: 1px solid var(--border-hi);
   font-weight: 400; text-transform: uppercase; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
 }
+
 td {
   font-size: 12px; color: var(--text);
   padding: 7px 12px; border-bottom: 1px solid var(--border);
@@ -604,7 +606,7 @@ th { position: relative; }
   <div class="chart-area">
     <div class="chart-block">
       <div class="chart-header">
-        <span class="chart-title">Beneficio por hora (PnL)</span>
+        <span class="chart-title">Beneficio últimas 24h (PnL)</span>
         <span class="chart-last" id="dailyLast">ÚLTIMO: —</span>
       </div>
       <canvas id="dailyChart"></canvas>
@@ -1002,13 +1004,21 @@ function drawChart(id, series, lineColor, fillColor, badgeId){
   for(let y=0;y<ch;y+=28){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(cw,y); ctx.stroke(); }
 
   const pad  = {l:50, r:14, t:12, b:24};
-  const parsedPoints = (series||[]).map((d, i)=>{
+  let parsedPoints = (series||[]).map((d, i)=>{
     if(Array.isArray(d)) return {x:d[0] ?? i, y:Number(d[1])};
     if(d && typeof d === 'object'){
       return {x:d.day ?? d.date ?? d.x ?? i, y:Number(d.pnl ?? d.value ?? d.y ?? d[1])};
     }
     return {x:i, y:Number(d)};
   }).filter(p=>isFinite(p.y));
+
+  if(id==='dailyChart'){
+    const cutoff = Date.now() - (24 * 60 * 60 * 1000);
+    parsedPoints = parsedPoints.filter((p)=>{
+      const t = Date.parse(String(p.x));
+      return Number.isFinite(t) && t >= cutoff;
+    });
+  }
 
   if(!parsedPoints.length){
     ctx.fillStyle='rgba(61,102,72,0.6)'; ctx.font='11px IBM Plex Mono,monospace';
@@ -1198,7 +1208,7 @@ function enableColumnResize(){
     handle.addEventListener('mousedown',(e)=>{
       e.preventDefault();
       startX=e.clientX; startW=th.offsetWidth;
-      const onMove=(ev)=>{ th.style.width = Math.max(70, startW + (ev.clientX-startX)) + 'px'; };
+      const onMove=(ev)=>{ th.style.width = Math.max(10, startW + (ev.clientX-startX)) + 'px'; };
       const onUp=()=>{ document.removeEventListener('mousemove',onMove); document.removeEventListener('mouseup',onUp); };
       document.addEventListener('mousemove',onMove);
       document.addEventListener('mouseup',onUp);
