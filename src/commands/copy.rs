@@ -484,7 +484,9 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
             }
             let app_clone = app.clone();
             tokio::spawn(async move {
-                let _ = monitor_loop(app_clone).await;
+                if let Err(e) = monitor_loop(app_clone).await {
+                    log_copy_event("core", format!("monitor loop finalizado con error: {e}"));
+                }
             });
             write_response(&mut stream, "200 OK", "application/json", "{\"ok\":true}")?;
         }
@@ -512,7 +514,9 @@ fn log_copy_event(mode: &str, message: impl AsRef<str>) {
 async fn monitor_loop(app: UiAppState) -> Result<()> {
     let data_client = polymarket_client_sdk::data::Client::default();
     let clob_client = polymarket_client_sdk::clob::Client::default();
+    let mut loop_tick: u64 = 0;
     loop {
+        loop_tick = loop_tick.saturating_add(1);
         let (running, cfg, poll_ms) = {
             let runtime = app.runtime.lock().await;
             (
@@ -535,14 +539,40 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             break;
         };
 
+        log_copy_event(
+            "core",
+            format!(
+                "ciclo monitor #{loop_tick} iniciado (mode={}, poll={}ms)",
+                if cfg.simulation_mode { "sim" } else { "real" },
+                poll_ms
+            ),
+        );
+
         if cfg.simulation_mode {
             log_copy_event("sim", format!("tick simulacion (poll={}ms)", poll_ms));
-            simulation_step(&app, &cfg, &data_client, &clob_client).await?;
+            if let Err(e) = simulation_step(&app, &cfg, &data_client, &clob_client).await {
+                let mut runtime = app.runtime.lock().await;
+                runtime.warning = Some(format!("Error en tick simulación: {e}"));
+                log_copy_event("sim", format!("tick simulación con error: {e}"));
+            }
+            log_copy_event(
+                "core",
+                format!("ciclo monitor #{loop_tick} finalizado; esperando {poll_ms}ms"),
+            );
             tokio::time::sleep(Duration::from_millis(poll_ms)).await;
             continue;
         }
 
-        let leader = crate::commands::parse_address(&cfg.leader)?;
+        let leader = match crate::commands::parse_address(&cfg.leader) {
+            Ok(addr) => addr,
+            Err(e) => {
+                let mut runtime = app.runtime.lock().await;
+                runtime.warning = Some(format!("Leader inválido: {e}"));
+                log_copy_event("real", format!("error parseando leader: {e}"));
+                tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+                continue;
+            }
+        };
         let value_req = ValueRequest::builder().user(leader).build();
         let leader_value = data_client
             .value(&value_req)
@@ -763,6 +793,10 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             }
         }
 
+        log_copy_event(
+            "core",
+            format!("ciclo monitor #{loop_tick} finalizado; esperando {poll_ms}ms"),
+        );
         tokio::time::sleep(Duration::from_millis(poll_ms)).await;
     }
     log_copy_event("core", "monitor loop finalizado");
@@ -816,7 +850,15 @@ async fn simulation_step(
         runtime.simulation_tick = runtime.simulation_tick.saturating_add(1);
     }
 
-    let leader = crate::commands::parse_address(&cfg.leader)?;
+    let leader = match crate::commands::parse_address(&cfg.leader) {
+        Ok(addr) => addr,
+        Err(e) => {
+            let mut runtime = app.runtime.lock().await;
+            runtime.warning = Some(format!("Leader inválido en simulación: {e}"));
+            log_copy_event("sim", format!("error parseando leader: {e}"));
+            return Ok(());
+        }
+    };
     let value_req = ValueRequest::builder().user(leader).build();
     let leader_value = data_client
         .value(&value_req)
@@ -953,7 +995,18 @@ async fn simulation_step(
         );
 
         let has_liquidity =
-            has_book_liquidity_for_simulation(clob_client, &t, plan.capped_size).await?;
+            match has_book_liquidity_for_simulation(clob_client, &t, plan.capped_size).await {
+                Ok(v) => v,
+                Err(e) => {
+                    let mut runtime = app.runtime.lock().await;
+                    runtime.warning = Some(format!("Error chequeando liquidez simulación: {e}"));
+                    log_copy_event(
+                        "sim",
+                        format!("error chequeando liquidez {} ({}): {e}", t.slug, tx_hash),
+                    );
+                    continue;
+                }
+            };
         log_copy_event(
             "sim",
             format!(
