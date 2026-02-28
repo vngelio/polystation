@@ -604,7 +604,7 @@ th { position: relative; }
   <div class="chart-area">
     <div class="chart-block">
       <div class="chart-header">
-        <span class="chart-title">Beneficio diario (PnL)</span>
+        <span class="chart-title">Beneficio por hora (PnL)</span>
         <span class="chart-last" id="dailyLast">ÚLTIMO: —</span>
       </div>
       <canvas id="dailyChart"></canvas>
@@ -1096,7 +1096,9 @@ function drawChart(id, series, lineColor, fillColor, badgeId){
       const idx = Math.round((i*(points.length-1))/Math.max(1,tickCount-1));
       const x = toX(idx);
       const d = new Date(xTimes[idx]);
-      const label = `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}`;
+      const label = id==='dailyChart'
+        ? `${String(d.getHours()).padStart(2,'0')}:00`
+        : `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}`;
       ctx.textAlign = i===0 ? 'left' : (i===tickCount-1 ? 'right' : 'center');
       ctx.fillText(label, x, ch-6);
       ctx.strokeStyle='rgba(57,255,122,0.12)';

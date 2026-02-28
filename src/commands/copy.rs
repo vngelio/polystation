@@ -938,21 +938,31 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 ),
             );
 
-            let estimated_sim_price =
+            let (estimated_sim_price, has_full_liquidity) =
                 match estimate_simulated_copy_price_from_book(&clob_client, &t, plan.capped_size)
                     .await
                 {
-                    Ok(Some(px)) => {
-                        log_copy_event(
-                            "real",
-                            format!(
-                                "liquidez disponible para copiar {} ({}) px_sim={}",
-                                t.slug, tx_hash, px
-                            ),
-                        );
-                        Some(px)
+                    Ok((Some(px), full_fill)) => {
+                        if full_fill {
+                            log_copy_event(
+                                "real",
+                                format!(
+                                    "liquidez disponible para copiar {} ({}) px_sim={}",
+                                    t.slug, tx_hash, px
+                                ),
+                            );
+                        } else {
+                            log_copy_event(
+                                "real",
+                                format!(
+                                    "liquidez parcial para copiar {} ({}) px_sim={} (estimación con fill parcial)",
+                                    t.slug, tx_hash, px
+                                ),
+                            );
+                        }
+                        (Some(px), full_fill)
                     }
-                    Ok(None) => {
+                    Ok((None, _)) => {
                         log_copy_event(
                             "real",
                             format!(
@@ -960,7 +970,7 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                                 t.slug, tx_hash
                             ),
                         );
-                        None
+                        (None, false)
                     }
                     Err(e) => {
                         log_copy_event(
@@ -970,7 +980,7 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                                 t.slug, tx_hash, e
                             ),
                         );
-                        None
+                        (None, false)
                     }
                 };
 
@@ -981,6 +991,14 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 runtime.warning = Some(format!("Error ejecutando orden en wallet: {e}"));
                 log_copy_event("real", format!("error copiando orden {}: {e}", tx_hash));
                 continue;
+            }
+
+            if !has_full_liquidity {
+                let mut runtime = app.runtime.lock().await;
+                runtime.warning = Some(format!(
+                    "Liquidez parcial en {} ({}), estimación de precio con fill parcial",
+                    t.slug, tx_hash
+                ));
             }
 
             let record = MovementRecord {
@@ -1293,32 +1311,29 @@ async fn simulation_step(
             ),
         );
 
-        let estimated_sim_price = match estimate_simulated_copy_price_from_book(
-            clob_client,
-            &t,
-            plan.capped_size,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                let mut runtime = app.runtime.lock().await;
-                runtime.warning = Some(format!("Error chequeando liquidez simulación: {e}"));
-                log_copy_event(
-                    "sim",
-                    format!("error chequeando liquidez {} ({}): {e}", t.slug, tx_hash),
-                );
-                continue;
-            }
-        };
+        let (estimated_sim_price, has_full_liquidity) =
+            match estimate_simulated_copy_price_from_book(clob_client, &t, plan.capped_size).await {
+                Ok(v) => v,
+                Err(e) => {
+                    let mut runtime = app.runtime.lock().await;
+                    runtime.warning = Some(format!("Error chequeando liquidez simulación: {e}"));
+                    log_copy_event(
+                        "sim",
+                        format!("error chequeando liquidez {} ({}): {e}", t.slug, tx_hash),
+                    );
+                    continue;
+                }
+            };
         log_copy_event(
             "sim",
             format!(
                 "chequeo liquidez {} ({}): {}",
                 t.slug,
                 tx_hash,
-                if estimated_sim_price.is_some() {
+                if has_full_liquidity {
                     "SI"
+                } else if estimated_sim_price.is_some() {
+                    "PARCIAL"
                 } else {
                     "NO"
                 }
@@ -1338,6 +1353,14 @@ async fn simulation_step(
                 ),
             );
             continue;
+        }
+
+        if !has_full_liquidity {
+            let mut runtime = app.runtime.lock().await;
+            runtime.warning = Some(format!(
+                "Simulación: liquidez parcial en {} ({}), estimación de precio con fill parcial",
+                t.slug, tx_hash
+            ));
         }
 
         let record = MovementRecord {
@@ -1391,7 +1414,7 @@ async fn estimate_simulated_copy_price_from_book(
     clob_client: &polymarket_client_sdk::clob::Client,
     trade: &polymarket_client_sdk::data::types::response::Trade,
     copied_value_usd: Decimal,
-) -> Result<Option<Decimal>> {
+) -> Result<(Option<Decimal>, bool)> {
     let req = OrderBookSummaryRequest::builder()
         .token_id(trade.asset)
         .build();
@@ -1417,13 +1440,16 @@ async fn estimate_simulated_copy_price_from_book(
             filled_usdc += take_notional;
             remaining_usdc -= take_notional;
         }
-        if remaining_usdc > Decimal::ZERO || filled_shares <= Decimal::ZERO {
-            return Ok(None);
+        if filled_shares <= Decimal::ZERO {
+            return Ok((None, false));
         }
-        Ok(Some(filled_usdc / filled_shares))
+        Ok((
+            Some(filled_usdc / filled_shares),
+            remaining_usdc <= Decimal::ZERO,
+        ))
     } else {
         if trade.price <= Decimal::ZERO {
-            return Ok(None);
+            return Ok((None, false));
         }
         let mut remaining_shares = copied_value_usd / trade.price;
         let mut sold_shares = Decimal::ZERO;
@@ -1441,10 +1467,13 @@ async fn estimate_simulated_copy_price_from_book(
             received_usdc += take_shares * bid.price;
             remaining_shares -= take_shares;
         }
-        if remaining_shares > Decimal::ZERO || sold_shares <= Decimal::ZERO {
-            return Ok(None);
+        if sold_shares <= Decimal::ZERO {
+            return Ok((None, false));
         }
-        Ok(Some(received_usdc / sold_shares))
+        Ok((
+            Some(received_usdc / sold_shares),
+            remaining_shares <= Decimal::ZERO,
+        ))
     }
 }
 
@@ -2083,7 +2112,11 @@ fn load_state() -> Result<CopyState> {
 pub fn daily_pnl_series(movements: &[MovementRecord]) -> Vec<(String, Decimal)> {
     let mut by_day: BTreeMap<String, Decimal> = BTreeMap::new();
     for m in movements.iter().filter(|m| m.settled) {
-        let day = m.timestamp.get(0..10).unwrap_or("unknown").to_string();
+        let day = m
+            .timestamp
+            .get(0..13)
+            .map(|v| format!("{}:00", v.replace('T', " ")))
+            .unwrap_or_else(|| "unknown".to_string());
         by_day
             .entry(day)
             .and_modify(|x| *x += m.pnl)
@@ -2479,7 +2512,7 @@ mod tests {
                 "curPrice": "0",
                 "timestamp": 0,
                 "title": "t",
-                "slug": "btc-updown-5m",
+                "slug": "eth-updown-5m",
                 "icon": "",
                 "eventSlug": "e",
                 "outcome": "Yes",
@@ -2600,5 +2633,68 @@ mod tests {
         let settled = settle_open_movements_from_closed_positions(&mut state, &closed);
         assert!(settled.is_empty());
         assert!(!state.movements[0].settled);
+    }
+    #[test]
+    fn daily_series_groups_by_hour() {
+        let movements = vec![
+            MovementRecord {
+                movement_id: "m1".into(),
+                market: "mkt".into(),
+                timestamp: "2026-02-28T12:01:00Z".into(),
+                leader_value: d("10"),
+                leader_price: d("0.5"),
+                copied_value: d("5"),
+                simulated_copy_price: d("0.52"),
+                quantity: d("10"),
+                copy_side: "buy".into(),
+                outcome: "Yes".into(),
+                resolved_outcome: String::new(),
+                diff_pct: Decimal::ZERO,
+                estimated_total_fee_usd: Decimal::ZERO,
+                settled: true,
+                pnl: d("1.5"),
+            },
+            MovementRecord {
+                movement_id: "m2".into(),
+                market: "mkt".into(),
+                timestamp: "2026-02-28T12:40:00Z".into(),
+                leader_value: d("10"),
+                leader_price: d("0.5"),
+                copied_value: d("5"),
+                simulated_copy_price: d("0.52"),
+                quantity: d("10"),
+                copy_side: "buy".into(),
+                outcome: "Yes".into(),
+                resolved_outcome: String::new(),
+                diff_pct: Decimal::ZERO,
+                estimated_total_fee_usd: Decimal::ZERO,
+                settled: true,
+                pnl: d("0.5"),
+            },
+            MovementRecord {
+                movement_id: "m3".into(),
+                market: "mkt".into(),
+                timestamp: "2026-02-28T13:10:00Z".into(),
+                leader_value: d("10"),
+                leader_price: d("0.5"),
+                copied_value: d("5"),
+                simulated_copy_price: d("0.52"),
+                quantity: d("10"),
+                copy_side: "buy".into(),
+                outcome: "Yes".into(),
+                resolved_outcome: String::new(),
+                diff_pct: Decimal::ZERO,
+                estimated_total_fee_usd: Decimal::ZERO,
+                settled: true,
+                pnl: d("2"),
+            },
+        ];
+
+        let series = daily_pnl_series(&movements);
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].0, "2026-02-28 12:00");
+        assert_eq!(series[0].1, d("2.0"));
+        assert_eq!(series[1].0, "2026-02-28 13:00");
+        assert_eq!(series[1].1, d("2"));
     }
 }
