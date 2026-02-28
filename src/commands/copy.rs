@@ -600,6 +600,10 @@ fn log_copy_event(mode: &str, message: impl AsRef<str>) {
     let msg = message.as_ref();
     println!("[copy:{mode}] {msg}");
 
+    if !should_persist_copy_log_message(msg) {
+        return;
+    }
+
     let ts = Utc::now().to_rfc3339();
     let line = format!(
         "{ts}	mode={mode}	{msg}
@@ -622,6 +626,23 @@ fn log_copy_event(mode: &str, message: impl AsRef<str>) {
             let _ = f.write_all(line.as_bytes());
         }
     }
+}
+
+fn should_persist_copy_log_message(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+
+    // Avoid high-frequency noise in file logs (polling/query heartbeat).
+    if m.contains("consultando")
+        || m.contains("consulta trades completada")
+        || m.contains("consulta de cierres completada")
+        || m.contains("timeout consultando")
+        || m.contains("tick simulacion")
+        || m.contains("ciclo monitor")
+    {
+        return false;
+    }
+
+    true
 }
 
 async fn monitor_loop(app: UiAppState) -> Result<()> {
@@ -2124,6 +2145,38 @@ mod tests {
         let p = compute_plan(&cfg, &state, d("1000"), d("100")).unwrap();
         assert_eq!(p.capped_size, d("50"));
         assert_eq!(p.available_funds, d("50"));
+    }
+
+    #[test]
+    fn copy_log_filter_skips_high_frequency_query_messages() {
+        assert!(!should_persist_copy_log_message(
+            "consultando ultimos movimientos de la cuenta a copiar"
+        ));
+        assert!(!should_persist_copy_log_message(
+            "consulta trades completada: 20 movimientos"
+        ));
+        assert!(!should_persist_copy_log_message(
+            "consulta de cierres completada: 3 posiciones"
+        ));
+        assert!(!should_persist_copy_log_message(
+            "timeout consultando cierres (15s)"
+        ));
+        assert!(!should_persist_copy_log_message(
+            "tick simulacion (poll=50ms)"
+        ));
+        assert!(!should_persist_copy_log_message(
+            "ciclo monitor #12 finalizado; esperando 50ms"
+        ));
+
+        assert!(should_persist_copy_log_message(
+            "nueva apuesta detectada eth-updown-5m (...)"
+        ));
+        assert!(should_persist_copy_log_message(
+            "sell ... descartado: no hay inventario"
+        ));
+        assert!(should_persist_copy_log_message(
+            "resuelta simulacion sim-0xabc pnl=1.2"
+        ));
     }
 
     #[test]
