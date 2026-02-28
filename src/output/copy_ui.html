@@ -511,8 +511,8 @@ th { position: relative; }
       <div class="section-head">temporización</div>
       <div class="field">
         <label class="field-label" for="pollMs">POLL INTERVAL (ms)</label>
-        <input class="field-input" id="pollMs" type="number" min="500" step="250" value="2000" />
-        <span class="field-hint">Frecuencia de consulta al servidor. Mín. 500ms, o 50ms en modo tiempo real.</span>
+        <input class="field-input" id="pollMs" type="number" min="50" step="50" value="2000" />
+        <span class="field-hint">Frecuencia de consulta al servidor. Mín. 50ms en simulación o modo tiempo real; 500ms en modo real normal.</span>
       </div>
     </div>
 
@@ -883,7 +883,7 @@ function setMode(m, src='server'){
     document.getElementById('realOnlyControls').classList.add('hidden');
     document.getElementById('simOnlyHint').classList.remove('hidden');
     const p = document.getElementById('pollMs');
-    p.min = 500; if(Number(p.value) < 500) p.value = 500;
+    p.min = 50; p.step = 50; if(Number(p.value) < 50) p.value = 50;
   } else {
     document.getElementById('realOnlyControls').classList.remove('hidden');
     document.getElementById('simOnlyHint').classList.add('hidden');
@@ -893,11 +893,16 @@ function setMode(m, src='server'){
 }
 
 function toggleRealtime(){
-  if(mode !== 'real') return;
   const p  = document.getElementById('pollMs');
+  if(mode === 'simulacion'){
+    p.min = 50;
+    p.step = 50;
+    if(Number(p.value) < 50) p.value = 50;
+    return;
+  }
   const rt = document.getElementById('realtimeMode').checked;
-  if(rt){ p.min = 50;  if(Number(p.value) < 50)  p.value = 50; }
-  else  { p.min = 500; if(Number(p.value) < 500) p.value = 500; }
+  if(rt){ p.min = 50; p.step = 50; if(Number(p.value) < 50) p.value = 50; }
+  else  { p.min = 500; p.step = 250; if(Number(p.value) < 500) p.value = 500; }
 }
 
 async function api(path, opts={}){
@@ -913,7 +918,7 @@ async function api(path, opts={}){
 async function configure(){
   const rt = mode==='real' && document.getElementById('realtimeMode').checked;
   const p  = document.getElementById('pollMs');
-  const minMs = rt ? 50 : 500;
+  const minMs = (mode==='simulacion' || rt) ? 50 : 500;
   await api('/api/configure',{method:'POST', body:JSON.stringify({
     leader:                 document.getElementById('leader').value,
     allocated_funds:        document.getElementById('funds').value,

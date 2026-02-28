@@ -172,12 +172,16 @@ fn default_poll_interval_ms() -> u64 {
     2000
 }
 
-fn min_poll_ms(realtime_mode: bool) -> u64 {
-    if realtime_mode { 50 } else { 500 }
+fn min_poll_ms(realtime_mode: bool, simulation_mode: bool) -> u64 {
+    if realtime_mode || simulation_mode {
+        50
+    } else {
+        500
+    }
 }
 
-fn normalize_poll_ms(poll_ms: u64, realtime_mode: bool) -> u64 {
-    poll_ms.max(min_poll_ms(realtime_mode))
+fn normalize_poll_ms(poll_ms: u64, realtime_mode: bool, simulation_mode: bool) -> u64 {
+    poll_ms.max(min_poll_ms(realtime_mode, simulation_mode))
 }
 
 pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
@@ -195,6 +199,7 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
                     cfg.poll_interval_ms
                         .unwrap_or(cfg.poll_interval_secs.saturating_mul(1000)),
                     cfg.realtime_mode,
+                    cfg.simulation_mode,
                 ),
                 risk_level: cfg.risk_level,
                 execute_orders: cfg.execute_orders,
@@ -363,7 +368,7 @@ async fn run_ui(ui: UiArgs) -> Result<()> {
             monitoring: false,
             current_poll_interval_ms: load_config()
                 .ok()
-                .map(|c| normalize_poll_ms(c.poll_interval_ms, c.realtime_mode))
+                .map(|c| normalize_poll_ms(c.poll_interval_ms, c.realtime_mode, c.simulation_mode))
                 .unwrap_or(default_poll_interval_ms()),
             warning: None,
             last_seen_hashes: HashSet::new(),
@@ -487,6 +492,7 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
                     cfg.poll_interval_ms
                         .unwrap_or(cfg.poll_interval_secs.saturating_mul(1000)),
                     cfg.realtime_mode,
+                    cfg.simulation_mode,
                 ),
                 risk_level: cfg.risk_level,
                 execute_orders: cfg.execute_orders,
@@ -589,6 +595,11 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                         .config
                         .as_ref()
                         .map(|c| c.realtime_mode)
+                        .unwrap_or(false),
+                    runtime
+                        .config
+                        .as_ref()
+                        .map(|c| c.simulation_mode)
                         .unwrap_or(false),
                 ),
             )
@@ -1421,7 +1432,7 @@ fn validate_config(cfg: &ConfigureArgs) -> Result<()> {
         bail!("realtime-mode and simulation-mode are mutually exclusive");
     }
     if let Some(ms) = cfg.poll_interval_ms
-        && ms < min_poll_ms(cfg.realtime_mode)
+        && ms < min_poll_ms(cfg.realtime_mode, cfg.simulation_mode)
     {
         bail!("poll-interval-ms too low for selected mode");
     }
