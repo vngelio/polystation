@@ -1657,7 +1657,7 @@ fn settle_open_movements_from_closed_positions(
 
         let mut pop_eligible_roi = |q: &mut VecDeque<(i64, Decimal)>| {
             while let Some((ts, _)) = q.front() {
-                if *ts < movement_ts {
+                if *ts > 0 && *ts < movement_ts {
                     q.pop_front();
                 } else {
                     break;
@@ -2223,6 +2223,58 @@ mod tests {
         assert_eq!(settled.len(), 2);
         assert_eq!(state.movements[0].pnl, d("-2"));
         assert_eq!(state.movements[1].pnl, d("1.6"));
+    }
+
+    #[test]
+    fn settle_allows_unknown_closed_timestamp_zero() {
+        use polymarket_client_sdk::data::types::response::ClosedPosition;
+
+        let mut state = CopyState {
+            movements: vec![MovementRecord {
+                movement_id: "m-zero-ts".into(),
+                market: "eth-updown-5m-1772281500".into(),
+                timestamp: "2026-02-28T12:30:00Z".into(),
+                leader_value: d("20"),
+                leader_price: Decimal::ZERO,
+                copied_value: d("10"),
+                simulated_copy_price: Decimal::ZERO,
+                quantity: Decimal::ZERO,
+                copy_side: "buy".into(),
+                outcome: "Yes".into(),
+                diff_pct: Decimal::ZERO,
+                estimated_total_fee_usd: Decimal::ZERO,
+                settled: false,
+                pnl: Decimal::ZERO,
+            }],
+        };
+
+        let closed: Vec<ClosedPosition> = serde_json::from_value(serde_json::json!([
+            {
+                "proxyWallet": "0x0000000000000000000000000000000000000001",
+                "asset": "1",
+                "conditionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "avgPrice": "0.5",
+                "totalBought": "20",
+                "realizedPnl": "2",
+                "curPrice": "0",
+                "timestamp": 0,
+                "title": "t",
+                "slug": "eth-updown-5m",
+                "icon": "",
+                "eventSlug": "e",
+                "outcome": "Yes",
+                "outcomeIndex": 0,
+                "oppositeOutcome": "No",
+                "oppositeAsset": "2",
+                "endDate": "2025-01-01T00:00:00Z"
+            }
+        ]))
+        .unwrap();
+
+        let settled = settle_open_movements_from_closed_positions(&mut state, &closed);
+        assert_eq!(settled.len(), 1);
+        assert!(state.movements[0].settled);
+        assert_eq!(state.movements[0].pnl, d("1"));
     }
 
     #[test]
