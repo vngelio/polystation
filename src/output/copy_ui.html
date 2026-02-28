@@ -988,12 +988,26 @@ function drawChart(id, series, lineColor, fillColor, badgeId){
   for(let y=0;y<ch;y+=28){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(cw,y); ctx.stroke(); }
 
   const pad  = {l:50, r:14, t:12, b:24};
-  const vals = (series||[]).map(d=>Number(d[1])).filter(v=>isFinite(v));
+  const parsedPoints = (series||[]).map((d, i)=>{
+    if(Array.isArray(d)) return {x:d[0] ?? i, y:Number(d[1])};
+    if(d && typeof d === 'object'){
+      return {x:d.day ?? d.date ?? d.x ?? i, y:Number(d.pnl ?? d.value ?? d.y ?? d[1])};
+    }
+    return {x:i, y:Number(d)};
+  }).filter(p=>isFinite(p.y));
 
-  if(!vals.length){
+  if(!parsedPoints.length){
     ctx.fillStyle='rgba(61,102,72,0.6)'; ctx.font='11px IBM Plex Mono,monospace';
     ctx.fillText('SIN DATOS', pad.l+10, ch/2+4); return;
   }
+
+  const points = parsedPoints.slice().sort((a,b)=>{
+    const ta = new Date(a.x).getTime();
+    const tb = new Date(b.x).getTime();
+    if(isFinite(ta) && isFinite(tb)) return ta - tb;
+    return 0;
+  });
+  const vals = points.map(p=>p.y);
 
   let mn=Math.min(...vals), mx=Math.max(...vals);
   if(mn===mx){ mn-=1; mx+=1; }
@@ -1010,16 +1024,31 @@ function drawChart(id, series, lineColor, fillColor, badgeId){
 
   const grad=ctx.createLinearGradient(0,pad.t,0,ch-pad.b);
   grad.addColorStop(0,fillColor); grad.addColorStop(1,'rgba(11,20,16,0)');
-  ctx.beginPath();
-  vals.forEach((v,i)=>{ const x=toX(i),y=toY(v); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
-  ctx.lineTo(toX(vals.length-1),ch-pad.b); ctx.lineTo(toX(0),ch-pad.b); ctx.closePath();
-  ctx.fillStyle=grad; ctx.fill();
 
-  ctx.strokeStyle=lineColor; ctx.lineWidth=2; ctx.shadowColor=lineColor; ctx.shadowBlur=5;
-  ctx.beginPath(); vals.forEach((v,i)=>{ const x=toX(i),y=toY(v); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); }); ctx.stroke();
+  if(vals.length > 1){
+    ctx.beginPath();
+    vals.forEach((v,i)=>{ const x=toX(i),y=toY(v); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
+    ctx.lineTo(toX(vals.length-1),ch-pad.b); ctx.lineTo(toX(0),ch-pad.b); ctx.closePath();
+    ctx.fillStyle=grad; ctx.fill();
+  } else {
+    const y = toY(vals[0]);
+    ctx.fillStyle = grad;
+    ctx.fillRect(pad.l, y, cw-pad.l-pad.r, ch-pad.b-y);
+  }
+
+  ctx.strokeStyle=lineColor; ctx.lineWidth=2; ctx.shadowColor=lineColor; ctx.shadowBlur=5; ctx.lineCap='round';
+  ctx.beginPath();
+  if(vals.length > 1){
+    vals.forEach((v,i)=>{ const x=toX(i),y=toY(v); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
+  } else {
+    const y = toY(vals[0]);
+    ctx.moveTo(pad.l, y);
+    ctx.lineTo(cw-pad.r, y);
+  }
+  ctx.stroke();
   ctx.shadowBlur=0;
 
-  const lx=toX(vals.length-1), ly=toY(vals[vals.length-1]);
+  const lx=vals.length > 1 ? toX(vals.length-1) : (cw-pad.r), ly=toY(vals[vals.length-1]);
   ctx.fillStyle=lineColor; ctx.shadowColor=lineColor; ctx.shadowBlur=8;
   ctx.beginPath(); ctx.arc(lx,ly,3.5,0,Math.PI*2); ctx.fill(); ctx.shadowBlur=0;
 
@@ -1031,6 +1060,7 @@ function drawChart(id, series, lineColor, fillColor, badgeId){
   const badge=document.getElementById(badgeId);
   if(badge){ badge.textContent=`ÚLTIMO: ${last>=0?'+':''}${last.toFixed(2)}`; badge.style.color=last>=0?'#5dff95':'#ff5050'; }
 }
+
 
 async function pollUpdates(){
   try{
