@@ -1293,9 +1293,9 @@ fn compute_plan(
     })
 }
 
-fn roi_by_slug_from_totals<'a>(
-    totals: HashMap<&'a str, (Decimal, Decimal)>,
-) -> HashMap<&'a str, Decimal> {
+fn roi_by_slug_from_totals(
+    totals: HashMap<String, (Decimal, Decimal)>,
+) -> HashMap<String, Decimal> {
     totals
         .into_iter()
         .filter_map(|(slug, (realized, bought))| {
@@ -1308,24 +1308,41 @@ fn roi_by_slug_from_totals<'a>(
         .collect()
 }
 
+fn normalize_market_slug(slug: &str) -> String {
+    let Some((prefix, suffix)) = slug.rsplit_once('-') else {
+        return slug.to_string();
+    };
+    if suffix.len() >= 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
+        prefix.to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
 fn settle_open_movements_from_closed_positions(
     state: &mut CopyState,
     closed_positions: &[polymarket_client_sdk::data::types::response::ClosedPosition],
 ) -> Vec<MovementRecord> {
-    let mut realized_and_bought_by_slug: HashMap<&str, (Decimal, Decimal)> = HashMap::new();
+    let mut realized_and_bought_by_slug: HashMap<String, (Decimal, Decimal)> = HashMap::new();
     for closed in closed_positions {
-        let entry = realized_and_bought_by_slug
-            .entry(closed.slug.as_str())
-            .or_insert((Decimal::ZERO, Decimal::ZERO));
-        entry.0 += closed.realized_pnl;
-        entry.1 += closed.total_bought;
+        for key in [closed.slug.clone(), normalize_market_slug(&closed.slug)] {
+            let entry = realized_and_bought_by_slug
+                .entry(key)
+                .or_insert((Decimal::ZERO, Decimal::ZERO));
+            entry.0 += closed.realized_pnl;
+            entry.1 += closed.total_bought;
+        }
     }
 
     let roi_by_slug = roi_by_slug_from_totals(realized_and_bought_by_slug);
 
     let mut settled = Vec::new();
     for movement in state.movements.iter_mut().filter(|m| !m.settled) {
-        let Some(roi) = roi_by_slug.get(movement.market.as_str()) else {
+        let normalized_market = normalize_market_slug(&movement.market);
+        let Some(roi) = roi_by_slug
+            .get(movement.market.as_str())
+            .or_else(|| roi_by_slug.get(normalized_market.as_str()))
+        else {
             continue;
         };
         movement.pnl = movement.copied_value * *roi;
@@ -1629,11 +1646,19 @@ mod tests {
     }
 
     #[test]
+    fn normalize_market_slug_strips_numeric_suffix() {
+        assert_eq!(
+            normalize_market_slug("xrp-updown-5m-1772278200"),
+            "xrp-updown-5m"
+        );
+        assert_eq!(normalize_market_slug("btc-updown-1h"), "btc-updown-1h");
+    }
+    #[test]
     fn roi_by_slug_from_totals_computes_weighted_roi() {
         let mut totals = HashMap::new();
-        totals.insert("btc-up", (d("25"), d("100")));
-        totals.insert("eth-down", (d("-10"), d("40")));
-        totals.insert("skip", (d("5"), d("0")));
+        totals.insert("btc-up".to_string(), (d("25"), d("100")));
+        totals.insert("eth-down".to_string(), (d("-10"), d("40")));
+        totals.insert("skip".to_string(), (d("5"), d("0")));
 
         let roi = roi_by_slug_from_totals(totals);
         assert_eq!(roi.get("btc-up"), Some(&d("0.25")));
