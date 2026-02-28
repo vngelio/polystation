@@ -382,6 +382,7 @@ td {
   font-size: 12px; color: var(--text);
   padding: 7px 12px; border-bottom: 1px solid var(--border);
   letter-spacing: 0.3px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 tbody tr:hover td { background: rgba(57,255,122,0.025); }
 td.mkt { color: var(--cyan); max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -627,8 +628,8 @@ th { position: relative; }
       <table>
         <thead>
           <tr>
-            <th>Hora</th><th>ID mov.</th><th>Mercado</th><th>Leader $</th>
-            <th>Invertido $</th><th>Diff %</th><th>Settled</th><th>PnL</th>
+            <th>Hora</th><th>ID mov.</th><th>Mercado</th><th>Leader $</th><th>Px leader</th>
+            <th>Invertido $</th><th>Px sim/cop</th><th>Cantidad</th><th>Diff %</th><th>Settled</th><th>PnL</th>
           </tr>
         </thead>
         <tbody id="moves"></tbody>
@@ -942,7 +943,7 @@ function rowHtml(m){
   const pc = !isNaN(pnl) ? (pnl >= 0 ? 'pos' : 'neg') : '';
   const mid = String(m.movement_id||'').slice(0,10);
   const settledTxt = m.settled ? 'true' : 'false';
-  return `<td class="ts">${m.timestamp}</td><td>${mid}</td><td class="mkt">${m.market}</td><td>${m.leader_value}</td><td>${m.copied_value}</td><td>${m.diff_pct}</td><td>${settledTxt}</td><td class="${pc}">${m.pnl}</td>`;
+  return `<td class="ts">${m.timestamp}</td><td>${mid}</td><td class="mkt">${m.market}</td><td>${m.leader_value}</td><td>${m.leader_price||"0"}</td><td>${m.copied_value}</td><td>${m.simulated_copy_price||"0"}</td><td>${m.quantity||"0"}</td><td>${m.diff_pct}</td><td>${settledTxt}</td><td class="${pc}">${m.pnl}</td>`;
 }
 
 function prependMove(m){

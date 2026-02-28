@@ -98,8 +98,16 @@ pub fn print_dashboard(state: &CopyState, output: OutputFormat) -> Result<()> {
     } else {
         for m in &state.movements {
             println!(
-                "- {} | {} | copied={} | diff={}pp | settled={} | pnl={}",
-                m.timestamp, m.market, m.copied_value, m.diff_pct, m.settled, m.pnl
+                "- {} | {} | leader_px={} | sim_px={} | qty={} | copied={} | diff={}pp | settled={} | pnl={}",
+                m.timestamp,
+                m.market,
+                m.leader_price,
+                m.simulated_copy_price,
+                m.quantity,
+                m.copied_value,
+                m.diff_pct,
+                m.settled,
+                m.pnl
             );
         }
     }
