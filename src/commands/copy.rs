@@ -602,7 +602,7 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
         );
         let closed_req = ClosedPositionsRequest::builder()
             .user(settlement_user)
-            .limit(200)?
+            .limit(50)?
             .build();
         let closed_positions = match tokio::time::timeout(
             Duration::from_secs(15),
@@ -873,7 +873,7 @@ async fn simulation_step(
     );
     let closed_req = ClosedPositionsRequest::builder()
         .user(leader)
-        .limit(200)?
+        .limit(50)?
         .build();
     let closed_positions = match tokio::time::timeout(
         Duration::from_secs(15),
