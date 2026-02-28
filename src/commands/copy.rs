@@ -146,7 +146,13 @@ pub struct MovementRecord {
     pub simulated_copy_price: Decimal,
     #[serde(default)]
     pub quantity: Decimal,
+    #[serde(default)]
+    pub copy_side: String,
+    #[serde(default)]
+    pub outcome: String,
     pub diff_pct: Decimal,
+    #[serde(default)]
+    pub estimated_total_fee_usd: Decimal,
     pub settled: bool,
     pub pnl: Decimal,
 }
@@ -168,12 +174,48 @@ fn default_poll_interval_ms() -> u64 {
     2000
 }
 
-fn min_poll_ms(realtime_mode: bool) -> u64 {
-    if realtime_mode { 50 } else { 500 }
+fn min_poll_ms(realtime_mode: bool, simulation_mode: bool) -> u64 {
+    if realtime_mode || simulation_mode {
+        50
+    } else {
+        500
+    }
 }
 
-fn normalize_poll_ms(poll_ms: u64, realtime_mode: bool) -> u64 {
-    poll_ms.max(min_poll_ms(realtime_mode))
+fn normalize_poll_ms(poll_ms: u64, realtime_mode: bool, simulation_mode: bool) -> u64 {
+    poll_ms.max(min_poll_ms(realtime_mode, simulation_mode))
+}
+
+const FAST_MARKET_FEE_BPS: u32 = 70;
+const BPS_DENOMINATOR: u32 = 10_000;
+
+fn is_fast_market_with_fee(slug: &str) -> bool {
+    let normalized = normalize_market_slug(slug);
+    normalized.contains("-updown-5m") || normalized.contains("-updown-15m")
+}
+
+fn trading_fee_impact_for_movement(
+    market: &str,
+    copied_value: Decimal,
+) -> Option<TradingFeeImpact> {
+    if !is_fast_market_with_fee(market) || copied_value <= Decimal::ZERO {
+        return None;
+    }
+
+    let fee_rate = Decimal::from(FAST_MARKET_FEE_BPS) / Decimal::from(BPS_DENOMINATOR);
+    let entry_fee_usd = copied_value * fee_rate;
+    let round_trip_fee_usd = entry_fee_usd * Decimal::from(2);
+    let max_gross_profit_usd =
+        copied_value * (Decimal::ONE - Decimal::from_i128_with_scale(100, 3));
+    let max_net_profit_usd = max_gross_profit_usd - round_trip_fee_usd;
+
+    Some(TradingFeeImpact {
+        fee_bps: FAST_MARKET_FEE_BPS,
+        entry_fee_usd,
+        round_trip_fee_usd,
+        max_gross_profit_usd,
+        max_net_profit_usd,
+    })
 }
 
 pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
@@ -191,6 +233,7 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
                     cfg.poll_interval_ms
                         .unwrap_or(cfg.poll_interval_secs.saturating_mul(1000)),
                     cfg.realtime_mode,
+                    cfg.simulation_mode,
                 ),
                 risk_level: cfg.risk_level,
                 execute_orders: cfg.execute_orders,
@@ -233,7 +276,10 @@ pub async fn execute(args: CopyArgs, output: OutputFormat) -> Result<()> {
                 copied_value: record.copied_value,
                 simulated_copy_price: Decimal::ZERO,
                 quantity: Decimal::ZERO,
+                copy_side: "unknown".to_string(),
+                outcome: String::new(),
                 diff_pct: record.diff_pct,
+                estimated_total_fee_usd: Decimal::ZERO,
                 settled: false,
                 pnl: Decimal::ZERO,
             };
@@ -331,9 +377,24 @@ struct DbMovement {
     simulated_copy_price: String,
     #[serde(default)]
     quantity: String,
+    #[serde(default)]
+    copy_side: String,
+    #[serde(default)]
+    outcome: String,
     diff_pct: String,
+    #[serde(default)]
+    estimated_total_fee_usd: String,
     settled: bool,
     pnl: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TradingFeeImpact {
+    fee_bps: u32,
+    entry_fee_usd: Decimal,
+    round_trip_fee_usd: Decimal,
+    max_gross_profit_usd: Decimal,
+    max_net_profit_usd: Decimal,
 }
 
 async fn run_ui(ui: UiArgs) -> Result<()> {
@@ -353,7 +414,7 @@ async fn run_ui(ui: UiArgs) -> Result<()> {
             monitoring: false,
             current_poll_interval_ms: load_config()
                 .ok()
-                .map(|c| normalize_poll_ms(c.poll_interval_ms, c.realtime_mode))
+                .map(|c| normalize_poll_ms(c.poll_interval_ms, c.realtime_mode, c.simulation_mode))
                 .unwrap_or(default_poll_interval_ms()),
             warning: None,
             last_seen_hashes: HashSet::new(),
@@ -403,11 +464,11 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
                 .as_ref()
                 .map(|c| c.allocated_funds)
                 .unwrap_or(Decimal::ZERO);
-            let settled_pnl: Decimal = db_state
+            let settled_pnl_after_fees: Decimal = db_state
                 .movements
                 .iter()
                 .filter(|m| m.settled)
-                .map(|m| m.pnl)
+                .map(|m| m.pnl - m.estimated_total_fee_usd)
                 .sum();
             let used_exposure: Decimal = db_state
                 .movements
@@ -415,7 +476,7 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
                 .filter(|m| !m.settled)
                 .map(|m| m.copied_value)
                 .sum();
-            let current_equity = initial_allocated_funds + settled_pnl;
+            let current_equity = initial_allocated_funds + settled_pnl_after_fees;
             let available_to_copy = (current_equity - used_exposure).max(Decimal::ZERO);
 
             let (_, mut recent_rows) = db_updates_since(mode, 0)?;
@@ -477,6 +538,7 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
                     cfg.poll_interval_ms
                         .unwrap_or(cfg.poll_interval_secs.saturating_mul(1000)),
                     cfg.realtime_mode,
+                    cfg.simulation_mode,
                 ),
                 risk_level: cfg.risk_level,
                 execute_orders: cfg.execute_orders,
@@ -579,6 +641,11 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                         .config
                         .as_ref()
                         .map(|c| c.realtime_mode)
+                        .unwrap_or(false),
+                    runtime
+                        .config
+                        .as_ref()
+                        .map(|c| c.simulation_mode)
                         .unwrap_or(false),
                 ),
             )
@@ -793,12 +860,34 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 continue;
             }
 
+            let fee_impact = trading_fee_impact_for_movement(&t.slug, plan.capped_size);
+            if let Some(impact) = fee_impact
+                && impact.max_net_profit_usd <= Decimal::ZERO
+            {
+                log_copy_event(
+                    "real",
+                    format!(
+                        "trade {} ({}) descartado por fees ({} bps): profit_max_neto={} (gross_max={} fee_entry={} fees_rt={})",
+                        t.slug,
+                        tx_hash,
+                        impact.fee_bps,
+                        impact.max_net_profit_usd,
+                        impact.max_gross_profit_usd,
+                        impact.entry_fee_usd,
+                        impact.round_trip_fee_usd,
+                    ),
+                );
+                continue;
+            }
+
             log_copy_event(
                 "real",
                 format!(
-                    "nueva apuesta detectada {} ({}) leader_usd={} leader_price={} cantidad={} copia_plan={} sim_price={} motivo={}",
+                    "nueva apuesta detectada {} ({}) side={} outcome={} leader_usd={} leader_price={} cantidad={} copia_plan={} sim_price={} motivo={}",
                     t.slug,
                     tx_hash,
+                    t.side,
+                    t.outcome,
                     t.size * t.price,
                     t.price,
                     t.size,
@@ -808,26 +897,41 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 ),
             );
 
-            match has_book_liquidity_for_simulation(&clob_client, &t, plan.capped_size).await {
-                Ok(true) => log_copy_event(
-                    "real",
-                    format!("liquidez disponible para copiar {} ({})", t.slug, tx_hash),
-                ),
-                Ok(false) => log_copy_event(
-                    "real",
-                    format!(
-                        "sin liquidez suficiente para copiar {} ({})",
-                        t.slug, tx_hash
-                    ),
-                ),
-                Err(e) => log_copy_event(
-                    "real",
-                    format!(
-                        "no se pudo validar liquidez para {} ({}): {}",
-                        t.slug, tx_hash, e
-                    ),
-                ),
-            }
+            let estimated_sim_price =
+                match estimate_simulated_copy_price_from_book(&clob_client, &t, plan.capped_size)
+                    .await
+                {
+                    Ok(Some(px)) => {
+                        log_copy_event(
+                            "real",
+                            format!(
+                                "liquidez disponible para copiar {} ({}) px_sim={}",
+                                t.slug, tx_hash, px
+                            ),
+                        );
+                        Some(px)
+                    }
+                    Ok(None) => {
+                        log_copy_event(
+                            "real",
+                            format!(
+                                "sin liquidez suficiente para copiar {} ({})",
+                                t.slug, tx_hash
+                            ),
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        log_copy_event(
+                            "real",
+                            format!(
+                                "no se pudo validar liquidez para {} ({}): {}",
+                                t.slug, tx_hash, e
+                            ),
+                        );
+                        None
+                    }
+                };
 
             if cfg.execute_orders
                 && let Err(e) = execute_copy_order_from_trade(&t, plan.capped_size).await
@@ -845,9 +949,14 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 leader_value: t.size * t.price,
                 leader_price: t.price,
                 copied_value: plan.capped_size,
-                simulated_copy_price: t.price,
+                simulated_copy_price: estimated_sim_price.unwrap_or(t.price),
                 quantity: t.size,
+                copy_side: t.side.to_string(),
+                outcome: t.outcome.clone(),
                 diff_pct: Decimal::ZERO,
+                estimated_total_fee_usd: fee_impact
+                    .map(|x| x.round_trip_fee_usd)
+                    .unwrap_or(Decimal::ZERO),
                 settled: false,
                 pnl: Decimal::ZERO,
             };
@@ -859,8 +968,10 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 log_copy_event(
                     "real",
                     format!(
-                        "orden copiada {} guardada en historial leader_price={} sim_price={} cantidad={}",
+                        "orden copiada {} guardada en historial side={} outcome={} leader_price={} sim_price={} cantidad={}",
                         record.movement_id,
+                        record.copy_side,
+                        record.outcome,
                         record.leader_price,
                         record.simulated_copy_price,
                         record.quantity
@@ -870,8 +981,10 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 log_copy_event(
                     "real",
                     format!(
-                        "orden registrada (dry-run) {} leader_price={} sim_price={} cantidad={}",
+                        "orden registrada (dry-run) {} side={} outcome={} leader_price={} sim_price={} cantidad={}",
                         record.movement_id,
+                        record.copy_side,
+                        record.outcome,
                         record.leader_price,
                         record.simulated_copy_price,
                         record.quantity
@@ -1087,12 +1200,34 @@ async fn simulation_step(
             continue;
         }
 
+        let fee_impact = trading_fee_impact_for_movement(&t.slug, plan.capped_size);
+        if let Some(impact) = fee_impact
+            && impact.max_net_profit_usd <= Decimal::ZERO
+        {
+            log_copy_event(
+                "sim",
+                format!(
+                    "simulacion descartada por fees {} ({}) ({} bps): profit_max_neto={} (gross_max={} fee_entry={} fees_rt={})",
+                    t.slug,
+                    tx_hash,
+                    impact.fee_bps,
+                    impact.max_net_profit_usd,
+                    impact.max_gross_profit_usd,
+                    impact.entry_fee_usd,
+                    impact.round_trip_fee_usd,
+                ),
+            );
+            continue;
+        }
+
         log_copy_event(
             "sim",
             format!(
-                "nueva apuesta detectada {} ({}) leader_usd={} leader_price={} cantidad={} simulacion_plan={} sim_price={} motivo={}",
+                "nueva apuesta detectada {} ({}) side={} outcome={} leader_usd={} leader_price={} cantidad={} simulacion_plan={} sim_price={} motivo={}",
                 t.slug,
                 tx_hash,
+                t.side,
+                t.outcome,
                 t.size * t.price,
                 t.price,
                 t.size,
@@ -1102,29 +1237,38 @@ async fn simulation_step(
             ),
         );
 
-        let has_liquidity =
-            match has_book_liquidity_for_simulation(clob_client, &t, plan.capped_size).await {
-                Ok(v) => v,
-                Err(e) => {
-                    let mut runtime = app.runtime.lock().await;
-                    runtime.warning = Some(format!("Error chequeando liquidez simulación: {e}"));
-                    log_copy_event(
-                        "sim",
-                        format!("error chequeando liquidez {} ({}): {e}", t.slug, tx_hash),
-                    );
-                    continue;
-                }
-            };
+        let estimated_sim_price = match estimate_simulated_copy_price_from_book(
+            clob_client,
+            &t,
+            plan.capped_size,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let mut runtime = app.runtime.lock().await;
+                runtime.warning = Some(format!("Error chequeando liquidez simulación: {e}"));
+                log_copy_event(
+                    "sim",
+                    format!("error chequeando liquidez {} ({}): {e}", t.slug, tx_hash),
+                );
+                continue;
+            }
+        };
         log_copy_event(
             "sim",
             format!(
                 "chequeo liquidez {} ({}): {}",
                 t.slug,
                 tx_hash,
-                if has_liquidity { "SI" } else { "NO" }
+                if estimated_sim_price.is_some() {
+                    "SI"
+                } else {
+                    "NO"
+                }
             ),
         );
-        if !has_liquidity {
+        if estimated_sim_price.is_none() {
             let mut runtime = app.runtime.lock().await;
             runtime.warning = Some(format!(
                 "Simulación: sin liquidez suficiente para {} ({})",
@@ -1147,9 +1291,14 @@ async fn simulation_step(
             leader_value: t.size * t.price,
             leader_price: t.price,
             copied_value: plan.capped_size,
-            simulated_copy_price: t.price,
+            simulated_copy_price: estimated_sim_price.unwrap_or(t.price),
             quantity: t.size,
+            copy_side: t.side.to_string(),
+            outcome: t.outcome.clone(),
             diff_pct: Decimal::ZERO,
+            estimated_total_fee_usd: fee_impact
+                .map(|x| x.round_trip_fee_usd)
+                .unwrap_or(Decimal::ZERO),
             settled: false,
             pnl: Decimal::ZERO,
         };
@@ -1160,8 +1309,10 @@ async fn simulation_step(
         log_copy_event(
             "sim",
             format!(
-                "apuesta simulada registrada {} leader_price={} sim_price={} cantidad={}",
+                "apuesta simulada registrada {} side={} outcome={} leader_price={} sim_price={} cantidad={}",
                 record.movement_id,
+                record.copy_side,
+                record.outcome,
                 record.leader_price,
                 record.simulated_copy_price,
                 record.quantity
@@ -1179,11 +1330,11 @@ async fn simulation_step(
     Ok(())
 }
 
-async fn has_book_liquidity_for_simulation(
+async fn estimate_simulated_copy_price_from_book(
     clob_client: &polymarket_client_sdk::clob::Client,
     trade: &polymarket_client_sdk::data::types::response::Trade,
     copied_value_usd: Decimal,
-) -> Result<bool> {
+) -> Result<Option<Decimal>> {
     let req = OrderBookSummaryRequest::builder()
         .token_id(trade.asset)
         .build();
@@ -1191,34 +1342,52 @@ async fn has_book_liquidity_for_simulation(
 
     if trade.side.to_string().eq_ignore_ascii_case("buy") {
         let mut remaining_usdc = copied_value_usd;
+        let mut filled_usdc = Decimal::ZERO;
+        let mut filled_shares = Decimal::ZERO;
         for ask in &book.asks {
             if remaining_usdc <= Decimal::ZERO {
                 break;
             }
             let level_notional = ask.size * ask.price;
-            if level_notional >= remaining_usdc {
-                remaining_usdc = Decimal::ZERO;
-                break;
+            let take_notional = if level_notional >= remaining_usdc {
+                remaining_usdc
+            } else {
+                level_notional
+            };
+            if ask.price > Decimal::ZERO {
+                filled_shares += take_notional / ask.price;
             }
-            remaining_usdc -= level_notional;
+            filled_usdc += take_notional;
+            remaining_usdc -= take_notional;
         }
-        Ok(remaining_usdc <= Decimal::ZERO)
+        if remaining_usdc > Decimal::ZERO || filled_shares <= Decimal::ZERO {
+            return Ok(None);
+        }
+        Ok(Some(filled_usdc / filled_shares))
     } else {
         if trade.price <= Decimal::ZERO {
-            return Ok(false);
+            return Ok(None);
         }
         let mut remaining_shares = copied_value_usd / trade.price;
+        let mut sold_shares = Decimal::ZERO;
+        let mut received_usdc = Decimal::ZERO;
         for bid in &book.bids {
             if remaining_shares <= Decimal::ZERO {
                 break;
             }
-            if bid.size >= remaining_shares {
-                remaining_shares = Decimal::ZERO;
-                break;
-            }
-            remaining_shares -= bid.size;
+            let take_shares = if bid.size >= remaining_shares {
+                remaining_shares
+            } else {
+                bid.size
+            };
+            sold_shares += take_shares;
+            received_usdc += take_shares * bid.price;
+            remaining_shares -= take_shares;
         }
-        Ok(remaining_shares <= Decimal::ZERO)
+        if remaining_shares > Decimal::ZERO || sold_shares <= Decimal::ZERO {
+            return Ok(None);
+        }
+        Ok(Some(received_usdc / sold_shares))
     }
 }
 
@@ -1355,7 +1524,7 @@ fn validate_config(cfg: &ConfigureArgs) -> Result<()> {
         bail!("realtime-mode and simulation-mode are mutually exclusive");
     }
     if let Some(ms) = cfg.poll_interval_ms
-        && ms < min_poll_ms(cfg.realtime_mode)
+        && ms < min_poll_ms(cfg.realtime_mode, cfg.simulation_mode)
     {
         bail!("poll-interval-ms too low for selected mode");
     }
@@ -1446,11 +1615,17 @@ fn is_market_closed(closed_keys: &HashSet<String>, market: &str) -> bool {
     closed_keys.contains(market) || closed_keys.contains(normalized_market.as_str())
 }
 
+fn movement_timestamp_epoch_seconds(ts: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
 fn settle_open_movements_from_closed_positions(
     state: &mut CopyState,
     closed_positions: &[polymarket_client_sdk::data::types::response::ClosedPosition],
 ) -> Vec<MovementRecord> {
-    let mut by_slug: HashMap<String, VecDeque<Decimal>> = HashMap::new();
+    let mut by_slug: HashMap<String, VecDeque<(i64, Decimal)>> = HashMap::new();
     let mut closed_sorted = closed_positions.to_vec();
     closed_sorted.sort_by_key(|c| c.timestamp);
 
@@ -1463,9 +1638,12 @@ fn settle_open_movements_from_closed_positions(
         by_slug
             .entry(closed.slug.clone())
             .or_default()
-            .push_back(roi);
+            .push_back((closed.timestamp, roi));
         if normalized != closed.slug {
-            by_slug.entry(normalized).or_default().push_back(roi);
+            by_slug
+                .entry(normalized)
+                .or_default()
+                .push_back((closed.timestamp, roi));
         }
     }
 
@@ -1473,13 +1651,28 @@ fn settle_open_movements_from_closed_positions(
     for movement in state.movements.iter_mut().filter(|m| !m.settled) {
         let normalized_market = normalize_market_slug(&movement.market);
 
+        let Some(movement_ts) = movement_timestamp_epoch_seconds(&movement.timestamp) else {
+            continue;
+        };
+
+        let mut pop_eligible_roi = |q: &mut VecDeque<(i64, Decimal)>| {
+            while let Some((ts, _)) = q.front() {
+                if *ts < movement_ts {
+                    q.pop_front();
+                } else {
+                    break;
+                }
+            }
+            q.pop_front().map(|(_, roi)| roi)
+        };
+
         let roi = by_slug
             .get_mut(movement.market.as_str())
-            .and_then(|q| q.pop_front())
+            .and_then(&mut pop_eligible_roi)
             .or_else(|| {
                 by_slug
                     .get_mut(normalized_market.as_str())
-                    .and_then(|q| q.pop_front())
+                    .and_then(&mut pop_eligible_roi)
             });
 
         let Some(roi) = roi else {
@@ -1517,7 +1710,7 @@ fn append_settlement_log(mode: StorageMode, movement: &MovementRecord) -> Result
         fs::create_dir_all(parent)?;
     }
     let line = format!(
-        "{}\tmode={}\tmovement_id={}\tmarket={}\tleader_price={}\tsimulated_copy_price={}\tquantity={}\tcopied_value={}\tpnl={}\n",
+        "{}\tmode={}\tmovement_id={}\tmarket={}\tside={}\toutcome={}\tleader_price={}\tsimulated_copy_price={}\tquantity={}\tcopied_value={}\testimated_total_fee_usd={}\tpnl={}\n",
         Utc::now().to_rfc3339(),
         match mode {
             StorageMode::Real => "real",
@@ -1525,10 +1718,13 @@ fn append_settlement_log(mode: StorageMode, movement: &MovementRecord) -> Result
         },
         movement.movement_id,
         movement.market,
+        movement.copy_side,
+        movement.outcome,
         movement.leader_price,
         movement.simulated_copy_price,
         movement.quantity,
         movement.copied_value,
+        movement.estimated_total_fee_usd,
         movement.pnl,
     );
     let mut f = fs::OpenOptions::new()
@@ -1604,7 +1800,13 @@ struct DbRow {
     simulated_copy_price: String,
     #[serde(default)]
     quantity: String,
+    #[serde(default)]
+    copy_side: String,
+    #[serde(default)]
+    outcome: String,
     diff_pct: String,
+    #[serde(default)]
+    estimated_total_fee_usd: String,
     settled: bool,
     pnl: String,
 }
@@ -1651,7 +1853,10 @@ fn append_db_movement(mode: StorageMode, m: &MovementRecord) -> Result<()> {
         copied_value: m.copied_value.to_string(),
         simulated_copy_price: m.simulated_copy_price.to_string(),
         quantity: m.quantity.to_string(),
+        copy_side: m.copy_side.clone(),
+        outcome: m.outcome.clone(),
         diff_pct: m.diff_pct.to_string(),
+        estimated_total_fee_usd: m.estimated_total_fee_usd.to_string(),
         settled: m.settled,
         pnl: m.pnl.to_string(),
     });
@@ -1683,7 +1888,11 @@ fn load_state_from_db(mode: StorageMode) -> Result<CopyState> {
             simulated_copy_price: Decimal::from_str_exact(&r.simulated_copy_price)
                 .unwrap_or(Decimal::ZERO),
             quantity: Decimal::from_str_exact(&r.quantity).unwrap_or(Decimal::ZERO),
+            copy_side: r.copy_side,
+            outcome: r.outcome,
             diff_pct: Decimal::from_str_exact(&r.diff_pct).unwrap_or(Decimal::ZERO),
+            estimated_total_fee_usd: Decimal::from_str_exact(&r.estimated_total_fee_usd)
+                .unwrap_or(Decimal::ZERO),
             settled: r.settled,
             pnl: Decimal::from_str_exact(&r.pnl).unwrap_or(Decimal::ZERO),
         })
@@ -1708,7 +1917,10 @@ fn db_updates_since(mode: StorageMode, since: i64) -> Result<(i64, Vec<DbMovemen
             copied_value: r.copied_value,
             simulated_copy_price: r.simulated_copy_price,
             quantity: r.quantity,
+            copy_side: r.copy_side,
+            outcome: r.outcome,
             diff_pct: r.diff_pct,
+            estimated_total_fee_usd: r.estimated_total_fee_usd,
             settled: r.settled,
             pnl: r.pnl,
         })
@@ -1827,7 +2039,10 @@ mod tests {
                 copied_value: d("550"),
                 simulated_copy_price: Decimal::ZERO,
                 quantity: Decimal::ZERO,
+                copy_side: "unknown".into(),
+                outcome: String::new(),
                 diff_pct: Decimal::ZERO,
+                estimated_total_fee_usd: Decimal::ZERO,
                 settled: false,
                 pnl: Decimal::ZERO,
             }],
@@ -1835,6 +2050,20 @@ mod tests {
         let p = compute_plan(&cfg, &state, d("1000"), d("100")).unwrap();
         assert_eq!(p.capped_size, d("50"));
         assert_eq!(p.available_funds, d("50"));
+    }
+
+    #[test]
+    fn fast_market_fee_detection_and_impact() {
+        assert!(is_fast_market_with_fee("eth-updown-5m-1772281500"));
+        assert!(is_fast_market_with_fee("btc-updown-15m-1772281500"));
+        assert!(!is_fast_market_with_fee("btc-updown-1h-1772281500"));
+
+        let impact = trading_fee_impact_for_movement("eth-updown-5m-1772281500", d("10")).unwrap();
+        assert_eq!(impact.fee_bps, FAST_MARKET_FEE_BPS);
+        assert_eq!(impact.entry_fee_usd, d("0.07"));
+        assert_eq!(impact.round_trip_fee_usd, d("0.14"));
+        assert_eq!(impact.max_gross_profit_usd, d("9"));
+        assert_eq!(impact.max_net_profit_usd, d("8.86"));
     }
 
     #[test]
@@ -1859,7 +2088,10 @@ mod tests {
                 copied_value: "5".into(),
                 simulated_copy_price: "0".into(),
                 quantity: "0".into(),
+                copy_side: "unknown".into(),
+                outcome: String::new(),
                 diff_pct: "0".into(),
+                estimated_total_fee_usd: "0".into(),
                 settled: false,
                 pnl: "0".into(),
             },
@@ -1873,7 +2105,10 @@ mod tests {
                 copied_value: "5".into(),
                 simulated_copy_price: "0".into(),
                 quantity: "0".into(),
+                copy_side: "unknown".into(),
+                outcome: String::new(),
                 diff_pct: "0".into(),
+                estimated_total_fee_usd: "0".into(),
                 settled: true,
                 pnl: "1".into(),
             },
@@ -1887,7 +2122,10 @@ mod tests {
                 copied_value: "5".into(),
                 simulated_copy_price: "0".into(),
                 quantity: "0".into(),
+                copy_side: "unknown".into(),
+                outcome: String::new(),
                 diff_pct: "0".into(),
+                estimated_total_fee_usd: "0".into(),
                 settled: false,
                 pnl: "0".into(),
             },
@@ -1913,7 +2151,10 @@ mod tests {
                     copied_value: d("10"),
                     simulated_copy_price: Decimal::ZERO,
                     quantity: Decimal::ZERO,
+                    copy_side: "unknown".into(),
+                    outcome: String::new(),
                     diff_pct: Decimal::ZERO,
+                    estimated_total_fee_usd: Decimal::ZERO,
                     settled: false,
                     pnl: Decimal::ZERO,
                 },
@@ -1926,7 +2167,10 @@ mod tests {
                     copied_value: d("8"),
                     simulated_copy_price: Decimal::ZERO,
                     quantity: Decimal::ZERO,
+                    copy_side: "unknown".into(),
+                    outcome: String::new(),
                     diff_pct: Decimal::ZERO,
+                    estimated_total_fee_usd: Decimal::ZERO,
                     settled: false,
                     pnl: Decimal::ZERO,
                 },
@@ -1942,7 +2186,7 @@ mod tests {
                 "totalBought": "20",
                 "realizedPnl": "-4",
                 "curPrice": "0",
-                "timestamp": 1,
+                "timestamp": 1735689600,
                 "title": "t",
                 "slug": "btc-updown-5m",
                 "icon": "",
@@ -1961,7 +2205,7 @@ mod tests {
                 "totalBought": "10",
                 "realizedPnl": "2",
                 "curPrice": "0",
-                "timestamp": 2,
+                "timestamp": 1735689900,
                 "title": "t",
                 "slug": "btc-updown-5m",
                 "icon": "",
@@ -1979,5 +2223,56 @@ mod tests {
         assert_eq!(settled.len(), 2);
         assert_eq!(state.movements[0].pnl, d("-2"));
         assert_eq!(state.movements[1].pnl, d("1.6"));
+    }
+
+    #[test]
+    fn settle_does_not_close_new_movement_with_old_closed_position() {
+        use polymarket_client_sdk::data::types::response::ClosedPosition;
+
+        let mut state = CopyState {
+            movements: vec![MovementRecord {
+                movement_id: "m-new".into(),
+                market: "eth-updown-5m-1772281500".into(),
+                timestamp: "2026-02-28T12:30:00Z".into(),
+                leader_value: d("20"),
+                leader_price: Decimal::ZERO,
+                copied_value: d("10"),
+                simulated_copy_price: Decimal::ZERO,
+                quantity: Decimal::ZERO,
+                copy_side: "buy".into(),
+                outcome: "Yes".into(),
+                diff_pct: Decimal::ZERO,
+                estimated_total_fee_usd: Decimal::ZERO,
+                settled: false,
+                pnl: Decimal::ZERO,
+            }],
+        };
+
+        let closed: Vec<ClosedPosition> = serde_json::from_value(serde_json::json!([
+            {
+                "proxyWallet": "0x0000000000000000000000000000000000000001",
+                "asset": "1",
+                "conditionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "avgPrice": "0.5",
+                "totalBought": "20",
+                "realizedPnl": "2",
+                "curPrice": "0",
+                "timestamp": 1735689600,
+                "title": "t",
+                "slug": "eth-updown-5m",
+                "icon": "",
+                "eventSlug": "e",
+                "outcome": "Yes",
+                "outcomeIndex": 0,
+                "oppositeOutcome": "No",
+                "oppositeAsset": "2",
+                "endDate": "2025-01-01T00:00:00Z"
+            }
+        ]))
+        .unwrap();
+
+        let settled = settle_open_movements_from_closed_positions(&mut state, &closed);
+        assert!(settled.is_empty());
+        assert!(!state.movements[0].settled);
     }
 }

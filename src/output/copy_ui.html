@@ -511,8 +511,8 @@ th { position: relative; }
       <div class="section-head">temporización</div>
       <div class="field">
         <label class="field-label" for="pollMs">POLL INTERVAL (ms)</label>
-        <input class="field-input" id="pollMs" type="number" min="500" step="250" value="2000" />
-        <span class="field-hint">Frecuencia de consulta al servidor. Mín. 500ms, o 50ms en modo tiempo real.</span>
+        <input class="field-input" id="pollMs" type="number" min="50" step="50" value="2000" />
+        <span class="field-hint">Frecuencia de consulta al servidor. Mín. 50ms en simulación o modo tiempo real; 500ms en modo real normal.</span>
       </div>
     </div>
 
@@ -628,7 +628,7 @@ th { position: relative; }
       <table>
         <thead>
           <tr>
-            <th>Hora</th><th>ID mov.</th><th>Mercado</th><th>Leader $</th><th>Px leader</th>
+            <th>Hora</th><th>ID mov.</th><th>Mercado</th><th>Lado</th><th>Outcome</th><th>Leader $</th><th>Px leader</th>
             <th>Invertido $</th><th>Px sim/cop</th><th>Cantidad</th><th>Diff %</th><th>Settled</th><th>PnL</th>
           </tr>
         </thead>
@@ -883,7 +883,7 @@ function setMode(m, src='server'){
     document.getElementById('realOnlyControls').classList.add('hidden');
     document.getElementById('simOnlyHint').classList.remove('hidden');
     const p = document.getElementById('pollMs');
-    p.min = 500; if(Number(p.value) < 500) p.value = 500;
+    p.min = 50; p.step = 50; if(Number(p.value) < 50) p.value = 50;
   } else {
     document.getElementById('realOnlyControls').classList.remove('hidden');
     document.getElementById('simOnlyHint').classList.add('hidden');
@@ -893,11 +893,16 @@ function setMode(m, src='server'){
 }
 
 function toggleRealtime(){
-  if(mode !== 'real') return;
   const p  = document.getElementById('pollMs');
+  if(mode === 'simulacion'){
+    p.min = 50;
+    p.step = 50;
+    if(Number(p.value) < 50) p.value = 50;
+    return;
+  }
   const rt = document.getElementById('realtimeMode').checked;
-  if(rt){ p.min = 50;  if(Number(p.value) < 50)  p.value = 50; }
-  else  { p.min = 500; if(Number(p.value) < 500) p.value = 500; }
+  if(rt){ p.min = 50; p.step = 50; if(Number(p.value) < 50) p.value = 50; }
+  else  { p.min = 500; p.step = 250; if(Number(p.value) < 500) p.value = 500; }
 }
 
 async function api(path, opts={}){
@@ -913,7 +918,7 @@ async function api(path, opts={}){
 async function configure(){
   const rt = mode==='real' && document.getElementById('realtimeMode').checked;
   const p  = document.getElementById('pollMs');
-  const minMs = rt ? 50 : 500;
+  const minMs = (mode==='simulacion' || rt) ? 50 : 500;
   await api('/api/configure',{method:'POST', body:JSON.stringify({
     leader:                 document.getElementById('leader').value,
     allocated_funds:        document.getElementById('funds').value,
@@ -943,7 +948,7 @@ function rowHtml(m){
   const pc = !isNaN(pnl) ? (pnl >= 0 ? 'pos' : 'neg') : '';
   const mid = String(m.movement_id||'').slice(0,10);
   const settledTxt = m.settled ? 'true' : 'false';
-  return `<td class="ts">${m.timestamp}</td><td>${mid}</td><td class="mkt">${m.market}</td><td>${m.leader_value}</td><td>${m.leader_price||"0"}</td><td>${m.copied_value}</td><td>${m.simulated_copy_price||"0"}</td><td>${m.quantity||"0"}</td><td>${m.diff_pct}</td><td>${settledTxt}</td><td class="${pc}">${m.pnl}</td>`;
+  return `<td class="ts">${m.timestamp}</td><td>${mid}</td><td class="mkt">${m.market}</td><td>${m.copy_side||"unknown"}</td><td>${m.outcome||"—"}</td><td>${m.leader_value}</td><td>${m.leader_price||"0"}</td><td>${m.copied_value}</td><td>${m.simulated_copy_price||"0"}</td><td>${m.quantity||"0"}</td><td>${m.diff_pct}</td><td>${settledTxt}</td><td class="${pc}">${m.pnl}</td>`;
 }
 
 function prependMove(m){
@@ -1011,7 +1016,20 @@ function drawChart(id, series, lineColor, fillColor, badgeId){
 
   let mn=Math.min(...vals), mx=Math.max(...vals);
   if(mn===mx){ mn-=1; mx+=1; }
-  const toX = i => pad.l + (i*(cw-pad.l-pad.r))/Math.max(1,vals.length-1);
+  const range = mx - mn;
+  const padY = range * 0.1;
+  mn -= padY;
+  mx += padY;
+
+  const xTimes = points.map(p=>new Date(p.x).getTime());
+  const hasChronoAxis = xTimes.length > 1 && xTimes.every(t=>Number.isFinite(t));
+  const minX = hasChronoAxis ? Math.min(...xTimes) : 0;
+  const maxX = hasChronoAxis ? Math.max(...xTimes) : Math.max(1, vals.length-1);
+  const xSpan = Math.max(1, maxX - minX);
+  const toX = i => {
+    const xv = hasChronoAxis ? xTimes[i] : i;
+    return pad.l + ((xv - minX) * (cw - pad.l - pad.r)) / xSpan;
+  };
   const toY = v => ch-pad.b - ((v-mn)*(ch-pad.t-pad.b))/(mx-mn);
 
   ctx.strokeStyle='rgba(57,255,122,0.2)'; ctx.lineWidth=1;
@@ -1055,6 +1073,23 @@ function drawChart(id, series, lineColor, fillColor, badgeId){
   ctx.font='10px IBM Plex Mono,monospace'; ctx.fillStyle='rgba(61,102,72,0.85)';
   ctx.fillText(mx.toFixed(2), 2, pad.t+10);
   ctx.fillText(mn.toFixed(2), 2, ch-pad.b+3);
+
+  if(hasChronoAxis){
+    const tickCount = Math.min(4, points.length);
+    ctx.fillStyle='rgba(106,170,128,0.9)';
+    ctx.font='9px IBM Plex Mono,monospace';
+    for(let i=0;i<tickCount;i++){
+      const idx = Math.round((i*(points.length-1))/Math.max(1,tickCount-1));
+      const x = toX(idx);
+      const d = new Date(xTimes[idx]);
+      const label = `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}`;
+      ctx.textAlign = i===0 ? 'left' : (i===tickCount-1 ? 'right' : 'center');
+      ctx.fillText(label, x, ch-6);
+      ctx.strokeStyle='rgba(57,255,122,0.12)';
+      ctx.beginPath(); ctx.moveTo(x,pad.t); ctx.lineTo(x,ch-pad.b); ctx.stroke();
+    }
+    ctx.textAlign = 'left';
+  }
 
   const last=vals[vals.length-1];
   const badge=document.getElementById(badgeId);

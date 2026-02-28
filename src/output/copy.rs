@@ -98,9 +98,11 @@ pub fn print_dashboard(state: &CopyState, output: OutputFormat) -> Result<()> {
     } else {
         for m in &state.movements {
             println!(
-                "- {} | {} | leader_px={} | sim_px={} | qty={} | copied={} | diff={}pp | settled={} | pnl={}",
+                "- {} | {} | side={} | outcome={} | leader_px={} | sim_px={} | qty={} | copied={} | diff={}pp | settled={} | pnl={}",
                 m.timestamp,
                 m.market,
+                m.copy_side,
+                m.outcome,
                 m.leader_price,
                 m.simulated_copy_price,
                 m.quantity,

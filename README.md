@@ -459,7 +459,8 @@ La UI guarda histórico en una base de datos local JSONL en `~/.config/polymarke
 
 La UI tiene dos pestañas mutuamente excluyentes: **Modo real** y **Modo simulación**.
 - En **Modo real** puedes activar además la casilla de **Modo tiempo real** para bajar hasta 50ms (siempre con backoff automático +250ms en rate-limit/429).
-- En **Modo simulación** se desactiva el modo real y se simula la copia proporcional de movimientos usando la misma lógica de riesgo, incluyendo ganancias/pérdidas simuladas al resolver movimientos.
+- En **Modo simulación** se desactiva el modo real y se simula la copia proporcional de movimientos usando trades/cierres reales del líder + validación de liquidez.
+- En mercados rápidos `updown-5m`/`updown-15m` se aplica filtro de **trading fees**: si el beneficio máximo potencial neto de fees queda en negativo, el movimiento se descarta antes de copiar/simular.
 
 Flujo operativo de cada modo:
 
@@ -469,10 +470,10 @@ Flujo operativo de cada modo:
    - Calcula tamaño a copiar con la misma función de riesgo (proporcional por fondos asignados + caps de trade/exposición + mínimo en USD).
    - Persiste cada movimiento copiado en el historial real.
 2. **Modo simulación**
-   - Genera movimientos sintéticos del líder por `tick`.
+   - Consulta trades y cierres reales del líder en cada tick.
    - Reutiliza exactamente la misma función de sizing/riesgo que en real.
-   - Registra movimientos `sim-*` en el historial de simulación.
-   - Liquida periódicamente posiciones simuladas y aplica PnL sintético para evaluar estrategia.
+   - Verifica liquidez en order book antes de registrar movimientos `sim-*`.
+   - Calcula settle/PnL usando cierres reales del líder; para equity aplica ajuste de fees en mercados rápidos (`5m`/`15m`).
 
 ### Other
 
