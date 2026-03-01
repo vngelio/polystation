@@ -2117,10 +2117,11 @@ pub fn daily_pnl_series(movements: &[MovementRecord]) -> Vec<(String, Decimal)> 
             .get(0..13)
             .map(|v| format!("{}:00", v.replace('T', " ")))
             .unwrap_or_else(|| "unknown".to_string());
+        let net_pnl = m.pnl - m.estimated_total_fee_usd;
         by_day
             .entry(day)
-            .and_modify(|x| *x += m.pnl)
-            .or_insert(m.pnl);
+            .and_modify(|x| *x += net_pnl)
+            .or_insert(net_pnl);
     }
     by_day.into_iter().collect()
 }
@@ -2696,5 +2697,30 @@ mod tests {
         assert_eq!(series[0].1, d("2.0"));
         assert_eq!(series[1].0, "2026-02-28 13:00");
         assert_eq!(series[1].1, d("2"));
+    }
+    #[test]
+    fn daily_series_uses_net_pnl_after_fees() {
+        let movements = vec![MovementRecord {
+            movement_id: "m-net".into(),
+            market: "mkt".into(),
+            timestamp: "2026-02-28T12:01:00Z".into(),
+            leader_value: d("10"),
+            leader_price: d("0.5"),
+            copied_value: d("5"),
+            simulated_copy_price: d("0.52"),
+            quantity: d("10"),
+            copy_side: "buy".into(),
+            outcome: "Yes".into(),
+            resolved_outcome: String::new(),
+            diff_pct: Decimal::ZERO,
+            estimated_total_fee_usd: d("0.2"),
+            settled: true,
+            pnl: d("1.0"),
+        }];
+
+        let series = daily_pnl_series(&movements);
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].0, "2026-02-28 12:00");
+        assert_eq!(series[0].1, d("0.8"));
     }
 }

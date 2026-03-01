@@ -606,7 +606,7 @@ th { position: relative; }
   <div class="chart-area">
     <div class="chart-block">
       <div class="chart-header">
-        <span class="chart-title">Beneficio últimas 24h (PnL)</span>
+        <span class="chart-title">Beneficio acumulado últimas 24h (PnL)</span>
         <span class="chart-last" id="dailyLast">ÚLTIMO: —</span>
       </div>
       <canvas id="dailyChart"></canvas>
@@ -1017,6 +1017,17 @@ function drawChart(id, series, lineColor, fillColor, badgeId){
     parsedPoints = parsedPoints.filter((p)=>{
       const t = Date.parse(String(p.x));
       return Number.isFinite(t) && t >= cutoff;
+    });
+    parsedPoints = parsedPoints.sort((a,b)=>{
+      const ta = new Date(a.x).getTime();
+      const tb = new Date(b.x).getTime();
+      if(isFinite(ta) && isFinite(tb)) return ta - tb;
+      return 0;
+    });
+    let acc = 0;
+    parsedPoints = parsedPoints.map((p)=>{
+      acc += p.y;
+      return {x:p.x, y:acc};
     });
   }
 
