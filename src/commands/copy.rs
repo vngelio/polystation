@@ -744,39 +744,14 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             "real",
             format!("consultando cierres/resoluciones de la cuenta a copiar ({settlement_user})"),
         );
-        let closed_req = ClosedPositionsRequest::builder()
-            .user(settlement_user)
-            .limit(50)?
-            .build();
-        let closed_positions = match tokio::time::timeout(
-            Duration::from_secs(15),
-            data_client.closed_positions(&closed_req),
-        )
-        .await
-        {
-            Ok(Ok(positions)) => {
-                log_copy_event(
-                    "real",
-                    format!(
-                        "consulta de cierres completada: {} posiciones",
-                        positions.len()
-                    ),
-                );
-                positions
-            }
-            Ok(Err(e)) => {
-                let mut runtime = app.runtime.lock().await;
-                runtime.warning = Some(format!("Error consultando posiciones cerradas: {e}"));
-                log_copy_event("real", format!("error consultando cierres: {e}"));
-                Vec::new()
-            }
-            Err(_) => {
-                let mut runtime = app.runtime.lock().await;
-                runtime.warning = Some("Timeout consultando posiciones cerradas".to_string());
-                log_copy_event("real", "timeout consultando cierres (15s)");
-                Vec::new()
-            }
-        };
+        let closed_positions =
+            fetch_closed_positions_paginated(&data_client, settlement_user, "real").await;
+        if closed_positions.is_empty() {
+            let mut runtime = app.runtime.lock().await;
+            runtime.warning = Some(
+                "No se pudieron obtener cierres recientes (paginación vacía o error)".to_string(),
+            );
+        }
 
         let closed_keys = closed_slug_keys(&closed_positions);
         if let Some((oldest_movement_id, oldest_market)) =
@@ -1131,39 +1106,11 @@ async fn simulation_step(
         "sim",
         format!("consultando cierres/resoluciones de la cuenta a copiar ({leader})"),
     );
-    let closed_req = ClosedPositionsRequest::builder()
-        .user(leader)
-        .limit(50)?
-        .build();
-    let closed_positions = match tokio::time::timeout(
-        Duration::from_secs(15),
-        data_client.closed_positions(&closed_req),
-    )
-    .await
-    {
-        Ok(Ok(positions)) => {
-            log_copy_event(
-                "sim",
-                format!(
-                    "consulta de cierres completada: {} posiciones",
-                    positions.len()
-                ),
-            );
-            positions
-        }
-        Ok(Err(e)) => {
-            let mut runtime = app.runtime.lock().await;
-            runtime.warning = Some(format!("Error simulación consultando cerradas: {e}"));
-            log_copy_event("sim", format!("error consultando cierres: {e}"));
-            Vec::new()
-        }
-        Err(_) => {
-            let mut runtime = app.runtime.lock().await;
-            runtime.warning = Some("Timeout simulación consultando cierres".to_string());
-            log_copy_event("sim", "timeout consultando cierres (15s)");
-            Vec::new()
-        }
-    };
+    let closed_positions = fetch_closed_positions_paginated(data_client, leader, "sim").await;
+    if closed_positions.is_empty() {
+        let mut runtime = app.runtime.lock().await;
+        runtime.warning = Some("Simulación: no se pudieron obtener cierres recientes".to_string());
+    }
     let closed_keys = closed_slug_keys(&closed_positions);
     if let Some((oldest_movement_id, oldest_market)) =
         oldest_unsettled_from_db(StorageMode::Simulation)?
@@ -1408,6 +1355,80 @@ async fn simulation_step(
         );
     }
     Ok(())
+}
+
+async fn fetch_closed_positions_paginated(
+    data_client: &polymarket_client_sdk::data::Client,
+    user: alloy::primitives::Address,
+    log_scope: &str,
+) -> Vec<polymarket_client_sdk::data::types::response::ClosedPosition> {
+    const PAGE_SIZE: i32 = 50;
+    const MAX_PAGES: i32 = 40;
+
+    let mut offset = 0;
+    let mut out = Vec::new();
+
+    for page in 0..MAX_PAGES {
+        let req = match ClosedPositionsRequest::builder()
+            .user(user)
+            .limit(PAGE_SIZE)
+            .and_then(|b| b.maybe_offset(Some(offset)))
+        {
+            Ok(b) => b.build(),
+            Err(e) => {
+                log_copy_event(
+                    log_scope,
+                    format!("error construyendo request de cierres: {e}"),
+                );
+                break;
+            }
+        };
+
+        let batch =
+            match tokio::time::timeout(Duration::from_secs(15), data_client.closed_positions(&req))
+                .await
+            {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    log_copy_event(
+                        log_scope,
+                        format!(
+                            "error consultando cierres paginados (page={}, offset={}): {}",
+                            page, offset, e
+                        ),
+                    );
+                    break;
+                }
+                Err(_) => {
+                    log_copy_event(
+                        log_scope,
+                        format!(
+                            "timeout consultando cierres paginados (page={}, offset={})",
+                            page, offset
+                        ),
+                    );
+                    break;
+                }
+            };
+
+        let batch_len = batch.len();
+        out.extend(batch);
+        if batch_len < PAGE_SIZE as usize {
+            break;
+        }
+
+        offset += PAGE_SIZE;
+    }
+
+    log_copy_event(
+        log_scope,
+        format!(
+            "consulta de cierres paginada completada: {} posiciones",
+            out.len()
+        ),
+    );
+
+    out
 }
 
 async fn estimate_simulated_copy_price_from_book(
