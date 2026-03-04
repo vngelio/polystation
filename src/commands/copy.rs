@@ -344,6 +344,8 @@ struct RuntimeState {
     next_closed_sync_sim_at_ms: i64,
     closed_sync_backoff_real_ms: u64,
     closed_sync_backoff_sim_ms: u64,
+    closed_sync_real_in_flight: bool,
+    closed_sync_sim_in_flight: bool,
 }
 
 const CLOSED_SYNC_BASE_MS: u64 = 5_000;
@@ -435,6 +437,8 @@ async fn run_ui(ui: UiArgs) -> Result<()> {
             next_closed_sync_sim_at_ms: 0,
             closed_sync_backoff_real_ms: CLOSED_SYNC_BASE_MS,
             closed_sync_backoff_sim_ms: CLOSED_SYNC_BASE_MS,
+            closed_sync_real_in_flight: false,
+            closed_sync_sim_in_flight: false,
         })),
     };
 
@@ -845,77 +849,18 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
         let should_sync_closed = {
             let runtime = app.runtime.lock().await;
             closed_sync_due(runtime.next_closed_sync_real_at_ms)
+                && !runtime.closed_sync_real_in_flight
         };
 
         if should_sync_closed {
-            log_copy_event(
-                "real",
-                format!(
-                    "consultando cierres/resoluciones de la cuenta a copiar ({settlement_user})"
-                ),
-            );
-            let (closed_positions, closed_fetch_failed) =
-                match fetch_closed_positions_paginated(&data_client, settlement_user, "real").await
-                {
-                    Ok(v) => (v, false),
-                    Err(e) => {
-                        let mut runtime = app.runtime.lock().await;
-                        runtime.warning =
-                            Some(format!("Error consultando posiciones cerradas: {e}"));
-                        schedule_closed_sync_backoff(&mut runtime, StorageMode::Real);
-                        (Vec::new(), true)
-                    }
-                };
-
-            if !closed_fetch_failed && closed_positions.is_empty() {
+            {
                 let mut runtime = app.runtime.lock().await;
-                runtime.warning = Some(
-                    "No se pudieron obtener cierres recientes (paginación vacía o error)"
-                        .to_string(),
-                );
-                schedule_closed_sync_backoff(&mut runtime, StorageMode::Real);
-            } else {
-                let closed_keys = closed_slug_keys(&closed_positions);
-                if let Some((oldest_movement_id, oldest_market)) =
-                    oldest_unsettled_from_db(StorageMode::Real)?
-                {
-                    if is_market_closed(&closed_keys, &oldest_market) {
-                        log_copy_event(
-                            "real",
-                            format!(
-                                "cierre detectado para la apuesta abierta más antigua {} ({})",
-                                oldest_movement_id, oldest_market
-                            ),
-                        );
-                    }
-                }
-
-                let mut state = load_state()?;
-                let settled =
-                    settle_open_movements_from_closed_positions(&mut state, &closed_positions);
-                if !settled.is_empty() {
-                    save_state(&state)?;
-                    for movement in settled {
-                        log_copy_event(
-                            "real",
-                            format!(
-                                "resuelta {} (mercado={}) pnl={} -> fondos liberados",
-                                movement.movement_id, movement.market, movement.pnl
-                            ),
-                        );
-                        settle_db_movement(StorageMode::Real, &movement.movement_id, movement.pnl)?;
-                        if let Err(e) = append_settlement_log(StorageMode::Real, &movement) {
-                            log_copy_event(
-                                "real",
-                                format!("error escribiendo log de settlement: {e}"),
-                            );
-                        }
-                    }
-                }
-
-                let mut runtime = app.runtime.lock().await;
-                schedule_closed_sync_success(&mut runtime, StorageMode::Real);
+                runtime.closed_sync_real_in_flight = true;
             }
+            let app_bg = app.clone();
+            tokio::spawn(async move {
+                run_closed_sync_task(app_bg, settlement_user, StorageMode::Real, "real").await;
+            });
         }
 
         log_copy_event(
@@ -964,12 +909,15 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
 
         for t in trades {
             let tx_hash = t.transaction_hash.to_string();
+            let is_sell = t.side.to_string().eq_ignore_ascii_case("sell");
             {
                 let mut runtime = app.runtime.lock().await;
                 if runtime.last_seen_hashes.contains(&tx_hash) {
                     continue;
                 }
-                runtime.last_seen_hashes.insert(tx_hash.clone());
+                if !is_sell {
+                    runtime.last_seen_hashes.insert(tx_hash.clone());
+                }
             }
 
             let state = load_state()?;
@@ -996,11 +944,10 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                     log_copy_event(
                         "real",
                         format!(
-                            "sell {} ({}) descartado: no hay inventario comprado suficiente (outcome={}, required_shares={})",
+                            "sell {} ({}) sin inventario local suficiente (outcome={}, required_shares={}) -> forzando intento de sell espejo",
                             t.slug, tx_hash, t.outcome, required_sell_shares
                         ),
                     );
-                    continue;
                 }
             }
 
@@ -1135,7 +1082,7 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             }
 
             let record = MovementRecord {
-                movement_id: tx_hash,
+                movement_id: tx_hash.clone(),
                 market: t.slug,
                 timestamp: Utc::now().to_rfc3339(),
                 leader_value: t.size * t.price,
@@ -1157,6 +1104,10 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             updated.movements.push(record.clone());
             save_state(&updated)?;
             append_db_movement(StorageMode::Real, &record)?;
+            if is_sell {
+                let mut runtime = app.runtime.lock().await;
+                runtime.last_seen_hashes.insert(tx_hash.clone());
+            }
             if cfg.execute_orders {
                 log_copy_event(
                     "real",
@@ -1262,72 +1213,18 @@ async fn simulation_step(
 
     let should_sync_closed = {
         let runtime = app.runtime.lock().await;
-        closed_sync_due(runtime.next_closed_sync_sim_at_ms)
+        closed_sync_due(runtime.next_closed_sync_sim_at_ms) && !runtime.closed_sync_sim_in_flight
     };
 
     if should_sync_closed {
-        log_copy_event(
-            "sim",
-            format!("consultando cierres/resoluciones de la cuenta a copiar ({leader})"),
-        );
-        let (closed_positions, closed_fetch_failed) =
-            match fetch_closed_positions_paginated(data_client, leader, "sim").await {
-                Ok(v) => (v, false),
-                Err(e) => {
-                    let mut runtime = app.runtime.lock().await;
-                    runtime.warning = Some(format!("Error simulación consultando cerradas: {e}"));
-                    schedule_closed_sync_backoff(&mut runtime, StorageMode::Simulation);
-                    (Vec::new(), true)
-                }
-            };
-        if !closed_fetch_failed && closed_positions.is_empty() {
+        {
             let mut runtime = app.runtime.lock().await;
-            runtime.warning =
-                Some("Simulación: no se pudieron obtener cierres recientes".to_string());
-            schedule_closed_sync_backoff(&mut runtime, StorageMode::Simulation);
-        } else {
-            let closed_keys = closed_slug_keys(&closed_positions);
-            if let Some((oldest_movement_id, oldest_market)) =
-                oldest_unsettled_from_db(StorageMode::Simulation)?
-            {
-                if is_market_closed(&closed_keys, &oldest_market) {
-                    log_copy_event(
-                        "sim",
-                        format!(
-                            "cierre detectado para la apuesta abierta más antigua {} ({})",
-                            oldest_movement_id, oldest_market
-                        ),
-                    );
-                }
-            }
-
-            let mut state = load_state()?;
-            let settled =
-                settle_open_movements_from_closed_positions(&mut state, &closed_positions);
-            if !settled.is_empty() {
-                save_state(&state)?;
-                for movement in settled {
-                    log_copy_event(
-                        "sim",
-                        format!(
-                            "resuelta simulacion {} (mercado={}) pnl={} -> fondos liberados",
-                            movement.movement_id, movement.market, movement.pnl
-                        ),
-                    );
-                    settle_db_movement(
-                        StorageMode::Simulation,
-                        &movement.movement_id,
-                        movement.pnl,
-                    )?;
-                    if let Err(e) = append_settlement_log(StorageMode::Simulation, &movement) {
-                        log_copy_event("sim", format!("error escribiendo log de settlement: {e}"));
-                    }
-                }
-            }
-
-            let mut runtime = app.runtime.lock().await;
-            schedule_closed_sync_success(&mut runtime, StorageMode::Simulation);
+            runtime.closed_sync_sim_in_flight = true;
         }
+        let app_bg = app.clone();
+        tokio::spawn(async move {
+            run_closed_sync_task(app_bg, leader, StorageMode::Simulation, "sim").await;
+        });
     }
 
     log_copy_event(
@@ -1364,12 +1261,15 @@ async fn simulation_step(
 
     for t in trades {
         let tx_hash = t.transaction_hash.to_string();
+        let is_sell = t.side.to_string().eq_ignore_ascii_case("sell");
         {
             let mut runtime = app.runtime.lock().await;
             if runtime.last_seen_hashes.contains(&tx_hash) {
                 continue;
             }
-            runtime.last_seen_hashes.insert(tx_hash.clone());
+            if !is_sell {
+                runtime.last_seen_hashes.insert(tx_hash.clone());
+            }
         }
 
         let state = load_state()?;
@@ -1396,11 +1296,10 @@ async fn simulation_step(
                 log_copy_event(
                     "sim",
                     format!(
-                        "simulacion sell descartada {} ({}): no hay inventario comprado suficiente (outcome={}, required_shares={})",
+                        "simulacion sell {} ({}) sin inventario local suficiente (outcome={}, required_shares={}) -> forzando intento de sell espejo",
                         t.slug, tx_hash, t.outcome, required_sell_shares
                     ),
                 );
-                continue;
             }
         }
 
@@ -1516,6 +1415,10 @@ async fn simulation_step(
         updated.movements.push(record.clone());
         save_state(&updated)?;
         append_db_movement(StorageMode::Simulation, &record)?;
+        if is_sell {
+            let mut runtime = app.runtime.lock().await;
+            runtime.last_seen_hashes.insert(tx_hash.clone());
+        }
         log_copy_event(
             "sim",
             format!(
@@ -1538,6 +1441,103 @@ async fn simulation_step(
         );
     }
     Ok(())
+}
+
+async fn run_closed_sync_task(
+    app: UiAppState,
+    user: alloy::primitives::Address,
+    mode: StorageMode,
+    log_scope: &'static str,
+) {
+    log_copy_event(
+        log_scope,
+        format!("consultando cierres/resoluciones de la cuenta a copiar ({user})"),
+    );
+
+    let data_client = polymarket_client_sdk::data::Client::default();
+    let result = fetch_closed_positions_paginated(&data_client, user, log_scope).await;
+
+    match result {
+        Ok(closed_positions) => {
+            if closed_positions.is_empty() {
+                let mut runtime = app.runtime.lock().await;
+                runtime.warning = Some(match mode {
+                    StorageMode::Real => {
+                        "No se pudieron obtener cierres recientes (paginación vacía o error)"
+                            .to_string()
+                    }
+                    StorageMode::Simulation => {
+                        "Simulación: no se pudieron obtener cierres recientes".to_string()
+                    }
+                });
+                schedule_closed_sync_backoff(&mut runtime, mode);
+            } else {
+                let settle_result: Result<()> = (|| {
+                    let closed_keys = closed_slug_keys(&closed_positions);
+                    if let Some((oldest_movement_id, oldest_market)) =
+                        oldest_unsettled_from_db(mode)?
+                        && is_market_closed(&closed_keys, &oldest_market)
+                    {
+                        log_copy_event(
+                            log_scope,
+                            format!(
+                                "cierre detectado para la apuesta abierta más antigua {} ({})",
+                                oldest_movement_id, oldest_market
+                            ),
+                        );
+                    }
+
+                    let mut state = load_state()?;
+                    let settled =
+                        settle_open_movements_from_closed_positions(&mut state, &closed_positions);
+                    if !settled.is_empty() {
+                        save_state(&state)?;
+                        for movement in settled {
+                            log_copy_event(
+                                log_scope,
+                                format!(
+                                    "resuelta {} (mercado={}) pnl={} -> fondos liberados",
+                                    movement.movement_id, movement.market, movement.pnl
+                                ),
+                            );
+                            settle_db_movement(mode, &movement.movement_id, movement.pnl)?;
+                            if let Err(e) = append_settlement_log(mode, &movement) {
+                                log_copy_event(
+                                    log_scope,
+                                    format!("error escribiendo log de settlement: {e}"),
+                                );
+                            }
+                        }
+                    }
+
+                    Ok(())
+                })();
+
+                let mut runtime = app.runtime.lock().await;
+                match settle_result {
+                    Ok(_) => schedule_closed_sync_success(&mut runtime, mode),
+                    Err(e) => {
+                        runtime.warning = Some(format!("Error conciliando cierres: {e}"));
+                        schedule_closed_sync_backoff(&mut runtime, mode);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            let mut runtime = app.runtime.lock().await;
+            runtime.warning = Some(match mode {
+                StorageMode::Real => format!("Error consultando posiciones cerradas: {e}"),
+                StorageMode::Simulation => format!("Error simulación consultando cerradas: {e}"),
+            });
+            schedule_closed_sync_backoff(&mut runtime, mode);
+        }
+    }
+
+    let mut runtime = app.runtime.lock().await;
+    match mode {
+        StorageMode::Real => runtime.closed_sync_real_in_flight = false,
+        StorageMode::Simulation => runtime.closed_sync_sim_in_flight = false,
+    }
 }
 
 async fn fetch_closed_positions_paginated(
