@@ -791,6 +791,57 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             leader
         };
 
+        let mut remaining_wallet_value_usd = if cfg.execute_orders {
+            let wallet_value_req = ValueRequest::builder().user(settlement_user).build();
+            match tokio::time::timeout(
+                Duration::from_secs(15),
+                data_client.value(&wallet_value_req),
+            )
+            .await
+            {
+                Ok(Ok(v)) => {
+                    let total = v.first().map(|x| x.value).unwrap_or(Decimal::ZERO);
+                    log_copy_event(
+                        "real",
+                        format!(
+                            "valor actual wallet ejecutora {}: {} USD",
+                            settlement_user, total
+                        ),
+                    );
+                    Some(total)
+                }
+                Ok(Err(e)) => {
+                    let mut runtime = app.runtime.lock().await;
+                    runtime.warning = Some(format!(
+                        "No se pudo validar fondos de wallet ejecutora: {e}"
+                    ));
+                    log_copy_event(
+                        "real",
+                        format!(
+                            "error consultando valor wallet ejecutora {}: {}",
+                            settlement_user, e
+                        ),
+                    );
+                    None
+                }
+                Err(_) => {
+                    let mut runtime = app.runtime.lock().await;
+                    runtime.warning =
+                        Some("Timeout validando fondos de wallet ejecutora".to_string());
+                    log_copy_event(
+                        "real",
+                        format!(
+                            "timeout consultando valor wallet ejecutora {} (15s)",
+                            settlement_user
+                        ),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let should_sync_closed = {
             let runtime = app.runtime.lock().await;
             closed_sync_due(runtime.next_closed_sync_real_at_ms)
@@ -1036,13 +1087,43 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                     }
                 };
 
-            if cfg.execute_orders
-                && let Err(e) = execute_copy_order_from_trade(&t, plan.capped_size).await
-            {
-                let mut runtime = app.runtime.lock().await;
-                runtime.warning = Some(format!("Error ejecutando orden en wallet: {e}"));
-                log_copy_event("real", format!("error copiando orden {}: {e}", tx_hash));
-                continue;
+            if cfg.execute_orders {
+                let Some(wallet_available) = remaining_wallet_value_usd else {
+                    log_copy_event(
+                        "real",
+                        format!(
+                            "orden {} omitida: no se pudo validar balance real de wallet",
+                            tx_hash
+                        ),
+                    );
+                    continue;
+                };
+
+                if wallet_available < plan.capped_size {
+                    let mut runtime = app.runtime.lock().await;
+                    runtime.warning = Some(format!(
+                        "Fondos insuficientes en wallet ejecutora: disponible={} requerido={}",
+                        wallet_available, plan.capped_size
+                    ));
+                    log_copy_event(
+                        "real",
+                        format!(
+                            "orden {} omitida por fondos insuficientes (disponible={} requerido={})",
+                            tx_hash, wallet_available, plan.capped_size
+                        ),
+                    );
+                    continue;
+                }
+
+                if let Err(e) = execute_copy_order_from_trade(&t, plan.capped_size).await {
+                    let mut runtime = app.runtime.lock().await;
+                    runtime.warning = Some(format!("Error ejecutando orden en wallet: {e}"));
+                    log_copy_event("real", format!("error copiando orden {}: {e}", tx_hash));
+                    continue;
+                }
+
+                remaining_wallet_value_usd =
+                    Some((wallet_available - plan.capped_size).max(Decimal::ZERO));
             }
 
             if !has_full_liquidity {
