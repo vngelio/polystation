@@ -1884,12 +1884,20 @@ fn compute_plan(
     if leader_positions_value <= Decimal::ZERO {
         bail!("leader-positions-value must be > 0");
     }
-    let ratio = cfg.allocated_funds / leader_positions_value;
+    let settled_pnl_after_fees: Decimal = state
+        .movements
+        .iter()
+        .filter(|m| m.settled)
+        .map(|m| m.pnl - m.estimated_total_fee_usd)
+        .sum();
+    let effective_funds = (cfg.allocated_funds + settled_pnl_after_fees).max(Decimal::ZERO);
+
+    let ratio = effective_funds / leader_positions_value;
     let proportional = leader_movement_value * ratio;
 
-    let max_trade = cfg.allocated_funds * (cfg.max_trade_pct / Decimal::from(100));
+    let max_trade = effective_funds * (cfg.max_trade_pct / Decimal::from(100));
     let max_total_exposure =
-        cfg.allocated_funds * (cfg.max_total_exposure_pct / Decimal::from(100));
+        effective_funds * (cfg.max_total_exposure_pct / Decimal::from(100));
     let used_exposure: Decimal = state
         .movements
         .iter()
@@ -2936,4 +2944,47 @@ mod tests {
         assert_eq!(series[0].0, "2026-02-28 12:00");
         assert_eq!(series[0].1, d("0.8"));
     }
+    #[test]
+    fn plan_uses_current_equity_after_settled_pnl_and_fees() {
+        let cfg = CopyConfig {
+            leader: "0x1".into(),
+            allocated_funds: d("1000"),
+            max_trade_pct: d("10"),
+            max_total_exposure_pct: d("50"),
+            min_copy_usd: d("1"),
+            poll_interval_secs: 2,
+            poll_interval_ms: 2000,
+            risk_level: RiskLevel::Balanced,
+            execute_orders: false,
+            realtime_mode: false,
+            simulation_mode: false,
+        };
+        let state = CopyState {
+            movements: vec![MovementRecord {
+                movement_id: "s1".into(),
+                market: "mkt".into(),
+                timestamp: "2026-03-01T10:00:00Z".into(),
+                leader_value: d("100"),
+                leader_price: d("0.5"),
+                copied_value: d("50"),
+                simulated_copy_price: d("0.5"),
+                quantity: d("100"),
+                copy_side: "buy".into(),
+                outcome: "Yes".into(),
+                resolved_outcome: "Yes".into(),
+                diff_pct: Decimal::ZERO,
+                estimated_total_fee_usd: d("10"),
+                settled: true,
+                pnl: d("210"),
+            }],
+        };
+
+        let plan = compute_plan(&cfg, &state, d("1000"), d("200")).unwrap();
+        // Equity = 1000 + (210 - 10) = 1200; proportional = 200 * 1.2 = 240
+        // max_trade = 120 and max_total_exposure = 600, so capped = 120.
+        assert_eq!(plan.proportional_size, d("240"));
+        assert_eq!(plan.capped_size, d("120"));
+        assert_eq!(plan.available_funds, d("600"));
+    }
+
 }
