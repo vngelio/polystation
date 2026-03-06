@@ -985,9 +985,40 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 }
             }
 
-            let state = load_state()?;
+            let mut state = load_state()?;
             if state.movements.iter().any(|m| m.movement_id == tx_hash) {
                 continue;
+            }
+
+            if is_sell {
+                let settled_from_sell =
+                    settle_open_buys_from_sell_trade(&mut state, &t.slug, &t.outcome, t.price);
+                if !settled_from_sell.is_empty() {
+                    save_state(&state)?;
+                    for movement in settled_from_sell {
+                        settle_db_movement(StorageMode::Real, &movement.movement_id, movement.pnl)?;
+                        if let Err(e) = append_settlement_log(StorageMode::Real, &movement) {
+                            log_copy_event(
+                                "real",
+                                format!("error escribiendo log de settlement: {e}"),
+                            );
+                        }
+                        log_copy_event(
+                            "real",
+                            format!(
+                                "sell líder detectado: cerrada {} (mercado={}, outcome={}) pnl={} por precio de salida {}",
+                                movement.movement_id,
+                                movement.market,
+                                movement.outcome,
+                                movement.pnl,
+                                t.price
+                            ),
+                        );
+                    }
+                    let mut runtime = app.runtime.lock().await;
+                    runtime.last_seen_hashes.insert(tx_hash.clone());
+                    continue;
+                }
             }
 
             let plan = compute_plan(&cfg, &state, leader_value, t.size * t.price)?;
@@ -1353,10 +1384,42 @@ async fn simulation_step(
             }
         }
 
-        let state = load_state()?;
+        let mut state = load_state()?;
         let movement_id = format!("sim-{tx_hash}");
         if state.movements.iter().any(|m| m.movement_id == movement_id) {
             continue;
+        }
+
+        if is_sell {
+            let settled_from_sell =
+                settle_open_buys_from_sell_trade(&mut state, &t.slug, &t.outcome, t.price);
+            if !settled_from_sell.is_empty() {
+                save_state(&state)?;
+                for movement in settled_from_sell {
+                    settle_db_movement(
+                        StorageMode::Simulation,
+                        &movement.movement_id,
+                        movement.pnl,
+                    )?;
+                    if let Err(e) = append_settlement_log(StorageMode::Simulation, &movement) {
+                        log_copy_event("sim", format!("error escribiendo log de settlement: {e}"));
+                    }
+                    log_copy_event(
+                        "sim",
+                        format!(
+                            "sell líder (sim) detectado: cerrada {} (mercado={}, outcome={}) pnl={} por precio de salida {}",
+                            movement.movement_id,
+                            movement.market,
+                            movement.outcome,
+                            movement.pnl,
+                            t.price
+                        ),
+                    );
+                }
+                let mut runtime = app.runtime.lock().await;
+                runtime.last_seen_hashes.insert(tx_hash.clone());
+                continue;
+            }
         }
 
         let plan = compute_plan(cfg, &state, leader_value, t.size * t.price)?;
@@ -2040,6 +2103,51 @@ fn movement_copied_shares(m: &MovementRecord) -> Decimal {
         m.leader_price
     };
     copied_shares_from_notional(m.copied_value, px)
+}
+
+fn settle_open_buys_from_sell_trade(
+    state: &mut CopyState,
+    market: &str,
+    outcome: &str,
+    sell_price: Decimal,
+) -> Vec<MovementRecord> {
+    if sell_price <= Decimal::ZERO {
+        return Vec::new();
+    }
+
+    let normalized_market = normalize_market_slug(market);
+    let mut settled = Vec::new();
+
+    for movement in state.movements.iter_mut().filter(|m| !m.settled) {
+        if !movement.copy_side.eq_ignore_ascii_case("buy") {
+            continue;
+        }
+        if movement.outcome != outcome {
+            continue;
+        }
+        let movement_market_norm = normalize_market_slug(&movement.market);
+        if movement.market != market && movement_market_norm != normalized_market {
+            continue;
+        }
+
+        let entry_price = if movement.simulated_copy_price > Decimal::ZERO {
+            movement.simulated_copy_price
+        } else {
+            movement.leader_price
+        };
+        if entry_price <= Decimal::ZERO {
+            continue;
+        }
+
+        let roi = (sell_price - entry_price) / entry_price;
+        movement.pnl = movement.copied_value * roi;
+        movement.copy_side = "sell".to_string();
+        movement.resolved_outcome = outcome.to_string();
+        movement.settled = true;
+        settled.push(movement.clone());
+    }
+
+    settled
 }
 
 fn has_enough_inventory_for_sell(
@@ -2776,6 +2884,41 @@ mod tests {
             "xrp-updown-5m"
         );
         assert_eq!(normalize_market_slug("btc-updown-1h"), "btc-updown-1h");
+    }
+
+    #[test]
+    fn sell_trade_settles_open_buy_with_loss() {
+        let mut state = CopyState {
+            movements: vec![MovementRecord {
+                movement_id: "b1".into(),
+                market: "highest-temperature-in-ankara-on-march-7-2026-3c".into(),
+                timestamp: "2026-03-06T09:00:00Z".into(),
+                leader_value: d("473.90945"),
+                leader_price: d("0.9873113541666668"),
+                copied_value: d("98.49152826961924982793805508"),
+                simulated_copy_price: d("0.999"),
+                quantity: d("480"),
+                copy_side: "buy".into(),
+                outcome: "No".into(),
+                resolved_outcome: String::new(),
+                diff_pct: Decimal::ZERO,
+                estimated_total_fee_usd: Decimal::ZERO,
+                settled: false,
+                pnl: Decimal::ZERO,
+            }],
+        };
+
+        let settled = settle_open_buys_from_sell_trade(
+            &mut state,
+            "highest-temperature-in-ankara-on-march-7-2026-3c",
+            "No",
+            d("0.984"),
+        );
+
+        assert_eq!(settled.len(), 1);
+        assert!(state.movements[0].settled);
+        assert_eq!(state.movements[0].copy_side, "sell");
+        assert!(state.movements[0].pnl < Decimal::ZERO);
     }
 
     #[test]
