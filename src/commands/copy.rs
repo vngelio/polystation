@@ -1040,11 +1040,23 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                     log_copy_event(
                         "real",
                         format!(
-                            "sell {} ({}) sin inventario local suficiente (outcome={}, required_shares={}) -> forzando intento de sell espejo",
+                            "sell {} ({}) descartado: no hay buy abierto conciliable (outcome={}, required_shares={})",
                             t.slug, tx_hash, t.outcome, required_sell_shares
                         ),
                     );
+                    continue;
                 }
+
+                // If this path is reached, sell did not close previous buys via immediate settlement.
+                // Avoid creating open SELL rows; SELL must always close an existing BUY.
+                log_copy_event(
+                    "real",
+                    format!(
+                        "sell {} ({}) descartado: no se pudo conciliar cierre inmediato; evitando SELL abierto",
+                        t.slug, tx_hash
+                    ),
+                );
+                continue;
             }
 
             let fee_impact = trading_fee_impact_for_movement(&t.slug, plan.capped_size);
@@ -1440,11 +1452,21 @@ async fn simulation_step(
                 log_copy_event(
                     "sim",
                     format!(
-                        "simulacion sell {} ({}) sin inventario local suficiente (outcome={}, required_shares={}) -> forzando intento de sell espejo",
+                        "simulacion sell {} ({}) descartada: no hay buy abierto conciliable (outcome={}, required_shares={})",
                         t.slug, tx_hash, t.outcome, required_sell_shares
                     ),
                 );
+                continue;
             }
+
+            log_copy_event(
+                "sim",
+                format!(
+                    "simulacion sell {} ({}) descartada: no se pudo conciliar cierre inmediato; evitando SELL abierto",
+                    t.slug, tx_hash
+                ),
+            );
+            continue;
         }
 
         let fee_impact = trading_fee_impact_for_movement(&t.slug, plan.capped_size);
@@ -2884,6 +2906,40 @@ mod tests {
             "xrp-updown-5m"
         );
         assert_eq!(normalize_market_slug("btc-updown-1h"), "btc-updown-1h");
+    }
+
+    #[test]
+    fn sell_trade_without_open_buy_does_not_settle_anything() {
+        let mut state = CopyState {
+            movements: vec![MovementRecord {
+                movement_id: "only-buy-other-outcome".into(),
+                market: "highest-temperature-in-lucknow-on-march-5-2026-40c".into(),
+                timestamp: "2026-03-06T13:00:00Z".into(),
+                leader_value: d("10"),
+                leader_price: d("0.6"),
+                copied_value: d("5"),
+                simulated_copy_price: d("0.6"),
+                quantity: d("8"),
+                copy_side: "buy".into(),
+                outcome: "Yes".into(),
+                resolved_outcome: String::new(),
+                diff_pct: Decimal::ZERO,
+                estimated_total_fee_usd: Decimal::ZERO,
+                settled: false,
+                pnl: Decimal::ZERO,
+            }],
+        };
+
+        let settled = settle_open_buys_from_sell_trade(
+            &mut state,
+            "highest-temperature-in-lucknow-on-march-5-2026-40c",
+            "No",
+            d("0.001"),
+        );
+
+        assert!(settled.is_empty());
+        assert!(!state.movements[0].settled);
+        assert_eq!(state.movements[0].copy_side, "buy");
     }
 
     #[test]
