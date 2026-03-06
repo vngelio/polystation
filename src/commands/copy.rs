@@ -23,6 +23,7 @@ use polymarket_client_sdk::clob::types::{Amount, OrderType, Side as ClobSide};
 use polymarket_client_sdk::data::types::request::{
     ClosedPositionsRequest, TradesRequest, ValueRequest,
 };
+use polymarket_client_sdk::gamma::types::request::MarketsRequest;
 
 #[derive(Args)]
 pub struct CopyArgs {
@@ -346,10 +347,18 @@ struct RuntimeState {
     closed_sync_backoff_sim_ms: u64,
     closed_sync_real_in_flight: bool,
     closed_sync_sim_in_flight: bool,
+    next_market_sync_real_at_ms: i64,
+    next_market_sync_sim_at_ms: i64,
+    market_sync_backoff_real_ms: u64,
+    market_sync_backoff_sim_ms: u64,
+    market_sync_real_in_flight: bool,
+    market_sync_sim_in_flight: bool,
 }
 
-const CLOSED_SYNC_BASE_MS: u64 = 5_000;
+const CLOSED_SYNC_BASE_MS: u64 = 30_000;
 const CLOSED_SYNC_MAX_BACKOFF_MS: u64 = 30_000;
+const MARKET_SYNC_BASE_MS: u64 = 30_000;
+const MARKET_SYNC_MAX_BACKOFF_MS: u64 = 120_000;
 
 #[derive(Serialize)]
 struct UiStateResponse {
@@ -439,6 +448,12 @@ async fn run_ui(ui: UiArgs) -> Result<()> {
             closed_sync_backoff_sim_ms: CLOSED_SYNC_BASE_MS,
             closed_sync_real_in_flight: false,
             closed_sync_sim_in_flight: false,
+            next_market_sync_real_at_ms: 0,
+            next_market_sync_sim_at_ms: 0,
+            market_sync_backoff_real_ms: MARKET_SYNC_BASE_MS,
+            market_sync_backoff_sim_ms: MARKET_SYNC_BASE_MS,
+            market_sync_real_in_flight: false,
+            market_sync_sim_in_flight: false,
         })),
     };
 
@@ -705,6 +720,38 @@ fn schedule_closed_sync_backoff(runtime: &mut RuntimeState, mode: StorageMode) {
     }
 }
 
+fn schedule_market_sync_success(runtime: &mut RuntimeState, mode: StorageMode) {
+    match mode {
+        StorageMode::Real => {
+            runtime.market_sync_backoff_real_ms = MARKET_SYNC_BASE_MS;
+            runtime.next_market_sync_real_at_ms =
+                now_ms() + i64::try_from(MARKET_SYNC_BASE_MS).unwrap_or(30_000);
+        }
+        StorageMode::Simulation => {
+            runtime.market_sync_backoff_sim_ms = MARKET_SYNC_BASE_MS;
+            runtime.next_market_sync_sim_at_ms =
+                now_ms() + i64::try_from(MARKET_SYNC_BASE_MS).unwrap_or(30_000);
+        }
+    }
+}
+
+fn schedule_market_sync_backoff(runtime: &mut RuntimeState, mode: StorageMode) {
+    match mode {
+        StorageMode::Real => {
+            let current = runtime.market_sync_backoff_real_ms.max(MARKET_SYNC_BASE_MS);
+            let next = (current.saturating_mul(2)).min(MARKET_SYNC_MAX_BACKOFF_MS);
+            runtime.market_sync_backoff_real_ms = next;
+            runtime.next_market_sync_real_at_ms = now_ms() + i64::try_from(next).unwrap_or(120_000);
+        }
+        StorageMode::Simulation => {
+            let current = runtime.market_sync_backoff_sim_ms.max(MARKET_SYNC_BASE_MS);
+            let next = (current.saturating_mul(2)).min(MARKET_SYNC_MAX_BACKOFF_MS);
+            runtime.market_sync_backoff_sim_ms = next;
+            runtime.next_market_sync_sim_at_ms = now_ms() + i64::try_from(next).unwrap_or(120_000);
+        }
+    }
+}
+
 async fn monitor_loop(app: UiAppState) -> Result<()> {
     let data_client = polymarket_client_sdk::data::Client::default();
     let clob_client = polymarket_client_sdk::clob::Client::default();
@@ -863,6 +910,24 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             });
         }
 
+        let should_sync_market = {
+            let runtime = app.runtime.lock().await;
+            closed_sync_due(runtime.next_market_sync_real_at_ms)
+                && !runtime.market_sync_real_in_flight
+        };
+
+        if should_sync_market {
+            {
+                let mut runtime = app.runtime.lock().await;
+                runtime.market_sync_real_in_flight = true;
+            }
+            let app_bg = app.clone();
+            tokio::spawn(async move {
+                run_market_closed_sync_task(app_bg, settlement_user, StorageMode::Real, "real")
+                    .await;
+            });
+        }
+
         log_copy_event(
             "real",
             format!("consultando ultimos movimientos de la cuenta a copiar ({leader})"),
@@ -920,9 +985,40 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 }
             }
 
-            let state = load_state()?;
+            let mut state = load_state()?;
             if state.movements.iter().any(|m| m.movement_id == tx_hash) {
                 continue;
+            }
+
+            if is_sell {
+                let settled_from_sell =
+                    settle_open_buys_from_sell_trade(&mut state, &t.slug, &t.outcome, t.price);
+                if !settled_from_sell.is_empty() {
+                    save_state(&state)?;
+                    for movement in settled_from_sell {
+                        settle_db_movement(StorageMode::Real, &movement.movement_id, movement.pnl)?;
+                        if let Err(e) = append_settlement_log(StorageMode::Real, &movement) {
+                            log_copy_event(
+                                "real",
+                                format!("error escribiendo log de settlement: {e}"),
+                            );
+                        }
+                        log_copy_event(
+                            "real",
+                            format!(
+                                "sell líder detectado: cerrada {} (mercado={}, outcome={}) pnl={} por precio de salida {}",
+                                movement.movement_id,
+                                movement.market,
+                                movement.outcome,
+                                movement.pnl,
+                                t.price
+                            ),
+                        );
+                    }
+                    let mut runtime = app.runtime.lock().await;
+                    runtime.last_seen_hashes.insert(tx_hash.clone());
+                    continue;
+                }
             }
 
             let plan = compute_plan(&cfg, &state, leader_value, t.size * t.price)?;
@@ -1227,6 +1323,22 @@ async fn simulation_step(
         });
     }
 
+    let should_sync_market = {
+        let runtime = app.runtime.lock().await;
+        closed_sync_due(runtime.next_market_sync_sim_at_ms) && !runtime.market_sync_sim_in_flight
+    };
+
+    if should_sync_market {
+        {
+            let mut runtime = app.runtime.lock().await;
+            runtime.market_sync_sim_in_flight = true;
+        }
+        let app_bg = app.clone();
+        tokio::spawn(async move {
+            run_market_closed_sync_task(app_bg, leader, StorageMode::Simulation, "sim").await;
+        });
+    }
+
     log_copy_event(
         "sim",
         format!("consultando ultimos movimientos de la cuenta a copiar ({leader})"),
@@ -1272,10 +1384,42 @@ async fn simulation_step(
             }
         }
 
-        let state = load_state()?;
+        let mut state = load_state()?;
         let movement_id = format!("sim-{tx_hash}");
         if state.movements.iter().any(|m| m.movement_id == movement_id) {
             continue;
+        }
+
+        if is_sell {
+            let settled_from_sell =
+                settle_open_buys_from_sell_trade(&mut state, &t.slug, &t.outcome, t.price);
+            if !settled_from_sell.is_empty() {
+                save_state(&state)?;
+                for movement in settled_from_sell {
+                    settle_db_movement(
+                        StorageMode::Simulation,
+                        &movement.movement_id,
+                        movement.pnl,
+                    )?;
+                    if let Err(e) = append_settlement_log(StorageMode::Simulation, &movement) {
+                        log_copy_event("sim", format!("error escribiendo log de settlement: {e}"));
+                    }
+                    log_copy_event(
+                        "sim",
+                        format!(
+                            "sell líder (sim) detectado: cerrada {} (mercado={}, outcome={}) pnl={} por precio de salida {}",
+                            movement.movement_id,
+                            movement.market,
+                            movement.outcome,
+                            movement.pnl,
+                            t.price
+                        ),
+                    );
+                }
+                let mut runtime = app.runtime.lock().await;
+                runtime.last_seen_hashes.insert(tx_hash.clone());
+                continue;
+            }
         }
 
         let plan = compute_plan(cfg, &state, leader_value, t.size * t.price)?;
@@ -1443,6 +1587,159 @@ async fn simulation_step(
     Ok(())
 }
 
+fn unsettled_market_slugs(state: &CopyState) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for m in state.movements.iter().filter(|m| !m.settled) {
+        let normalized = normalize_market_slug(&m.market);
+        if seen.insert(normalized.clone()) {
+            out.push(normalized);
+        }
+    }
+    out
+}
+
+fn apply_settlements_from_closed_positions(
+    mode: StorageMode,
+    log_scope: &'static str,
+    closed_positions: &[polymarket_client_sdk::data::types::response::ClosedPosition],
+) -> Result<()> {
+    let closed_keys = closed_slug_keys(closed_positions);
+    if let Some((oldest_movement_id, oldest_market)) = oldest_unsettled_from_db(mode)?
+        && is_market_closed(&closed_keys, &oldest_market)
+    {
+        log_copy_event(
+            log_scope,
+            format!(
+                "cierre detectado para la apuesta abierta más antigua {} ({})",
+                oldest_movement_id, oldest_market
+            ),
+        );
+    }
+
+    let mut state = load_state()?;
+    let settled = settle_open_movements_from_closed_positions(&mut state, closed_positions);
+    if !settled.is_empty() {
+        save_state(&state)?;
+        for movement in settled {
+            log_copy_event(
+                log_scope,
+                format!(
+                    "resuelta {} (mercado={}) pnl={} -> fondos liberados",
+                    movement.movement_id, movement.market, movement.pnl
+                ),
+            );
+            settle_db_movement(mode, &movement.movement_id, movement.pnl)?;
+            if let Err(e) = append_settlement_log(mode, &movement) {
+                log_copy_event(
+                    log_scope,
+                    format!("error escribiendo log de settlement: {e}"),
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn fetch_closed_markets_from_gamma(
+    slugs: &[String],
+    log_scope: &str,
+) -> Result<HashSet<String>> {
+    const CHUNK_SIZE: usize = 25;
+
+    let gamma_client = polymarket_client_sdk::gamma::Client::default();
+    let mut closed = HashSet::new();
+
+    for chunk in slugs.chunks(CHUNK_SIZE) {
+        let req = MarketsRequest::builder()
+            .slug(chunk.to_vec())
+            .closed(true)
+            .build();
+        let markets = tokio::time::timeout(Duration::from_secs(15), gamma_client.markets(&req))
+            .await
+            .map_err(|_| anyhow!("timeout consultando mercados cerrados"))??;
+
+        for market in markets {
+            if market.closed.unwrap_or(false) {
+                if let Some(slug) = market.slug {
+                    closed.insert(normalize_market_slug(&slug));
+                }
+            }
+        }
+    }
+
+    log_copy_event(
+        log_scope,
+        format!(
+            "sync mercado: slugs consultados={}, cerrados_detectados={}",
+            slugs.len(),
+            closed.len()
+        ),
+    );
+
+    Ok(closed)
+}
+
+async fn run_market_closed_sync_task(
+    app: UiAppState,
+    user: alloy::primitives::Address,
+    mode: StorageMode,
+    log_scope: &'static str,
+) {
+    let result: Result<()> = async {
+        let state = load_state()?;
+        let unsettled_slugs = unsettled_market_slugs(&state);
+        if unsettled_slugs.is_empty() {
+            return Ok(());
+        }
+
+        let closed_market_slugs =
+            fetch_closed_markets_from_gamma(&unsettled_slugs, log_scope).await?;
+        if closed_market_slugs.is_empty() {
+            return Ok(());
+        }
+
+        let should_reconcile_user = unsettled_slugs
+            .iter()
+            .any(|s| closed_market_slugs.contains(s));
+        if !should_reconcile_user {
+            return Ok(());
+        }
+
+        log_copy_event(
+            log_scope,
+            format!(
+                "mercado reporta cierres para {} slugs; forzando conciliación por cuenta {}",
+                closed_market_slugs.len(),
+                user
+            ),
+        );
+
+        let data_client = polymarket_client_sdk::data::Client::default();
+        let closed_positions =
+            fetch_closed_positions_paginated(&data_client, user, log_scope).await?;
+        apply_settlements_from_closed_positions(mode, log_scope, &closed_positions)
+    }
+    .await;
+
+    let mut runtime = app.runtime.lock().await;
+    match result {
+        Ok(_) => schedule_market_sync_success(&mut runtime, mode),
+        Err(e) => {
+            runtime.warning = Some(match mode {
+                StorageMode::Real => format!("Error consultando cierre de mercados: {e}"),
+                StorageMode::Simulation => format!("Error simulación cierre de mercados: {e}"),
+            });
+            schedule_market_sync_backoff(&mut runtime, mode);
+        }
+    }
+    match mode {
+        StorageMode::Real => runtime.market_sync_real_in_flight = false,
+        StorageMode::Simulation => runtime.market_sync_sim_in_flight = false,
+    }
+}
+
 async fn run_closed_sync_task(
     app: UiAppState,
     user: alloy::primitives::Address,
@@ -1472,46 +1769,8 @@ async fn run_closed_sync_task(
                 });
                 schedule_closed_sync_backoff(&mut runtime, mode);
             } else {
-                let settle_result: Result<()> = (|| {
-                    let closed_keys = closed_slug_keys(&closed_positions);
-                    if let Some((oldest_movement_id, oldest_market)) =
-                        oldest_unsettled_from_db(mode)?
-                        && is_market_closed(&closed_keys, &oldest_market)
-                    {
-                        log_copy_event(
-                            log_scope,
-                            format!(
-                                "cierre detectado para la apuesta abierta más antigua {} ({})",
-                                oldest_movement_id, oldest_market
-                            ),
-                        );
-                    }
-
-                    let mut state = load_state()?;
-                    let settled =
-                        settle_open_movements_from_closed_positions(&mut state, &closed_positions);
-                    if !settled.is_empty() {
-                        save_state(&state)?;
-                        for movement in settled {
-                            log_copy_event(
-                                log_scope,
-                                format!(
-                                    "resuelta {} (mercado={}) pnl={} -> fondos liberados",
-                                    movement.movement_id, movement.market, movement.pnl
-                                ),
-                            );
-                            settle_db_movement(mode, &movement.movement_id, movement.pnl)?;
-                            if let Err(e) = append_settlement_log(mode, &movement) {
-                                log_copy_event(
-                                    log_scope,
-                                    format!("error escribiendo log de settlement: {e}"),
-                                );
-                            }
-                        }
-                    }
-
-                    Ok(())
-                })();
+                let settle_result =
+                    apply_settlements_from_closed_positions(mode, log_scope, &closed_positions);
 
                 let mut runtime = app.runtime.lock().await;
                 match settle_result {
@@ -1846,6 +2105,51 @@ fn movement_copied_shares(m: &MovementRecord) -> Decimal {
     copied_shares_from_notional(m.copied_value, px)
 }
 
+fn settle_open_buys_from_sell_trade(
+    state: &mut CopyState,
+    market: &str,
+    outcome: &str,
+    sell_price: Decimal,
+) -> Vec<MovementRecord> {
+    if sell_price <= Decimal::ZERO {
+        return Vec::new();
+    }
+
+    let normalized_market = normalize_market_slug(market);
+    let mut settled = Vec::new();
+
+    for movement in state.movements.iter_mut().filter(|m| !m.settled) {
+        if !movement.copy_side.eq_ignore_ascii_case("buy") {
+            continue;
+        }
+        if movement.outcome != outcome {
+            continue;
+        }
+        let movement_market_norm = normalize_market_slug(&movement.market);
+        if movement.market != market && movement_market_norm != normalized_market {
+            continue;
+        }
+
+        let entry_price = if movement.simulated_copy_price > Decimal::ZERO {
+            movement.simulated_copy_price
+        } else {
+            movement.leader_price
+        };
+        if entry_price <= Decimal::ZERO {
+            continue;
+        }
+
+        let roi = (sell_price - entry_price) / entry_price;
+        movement.pnl = movement.copied_value * roi;
+        movement.copy_side = "sell".to_string();
+        movement.resolved_outcome = outcome.to_string();
+        movement.settled = true;
+        settled.push(movement.clone());
+    }
+
+    settled
+}
+
 fn has_enough_inventory_for_sell(
     state: &CopyState,
     market: &str,
@@ -1896,8 +2200,7 @@ fn compute_plan(
     let proportional = leader_movement_value * ratio;
 
     let max_trade = effective_funds * (cfg.max_trade_pct / Decimal::from(100));
-    let max_total_exposure =
-        effective_funds * (cfg.max_total_exposure_pct / Decimal::from(100));
+    let max_total_exposure = effective_funds * (cfg.max_total_exposure_pct / Decimal::from(100));
     let used_exposure: Decimal = state
         .movements
         .iter()
@@ -1953,6 +2256,18 @@ fn closed_slug_keys(
     keys
 }
 
+fn calculate_settlement_pnl_from_invested(
+    invested_usd: Decimal,
+    total_bought_usd: Decimal,
+    realized_pnl_usd: Decimal,
+) -> Decimal {
+    if invested_usd <= Decimal::ZERO || total_bought_usd <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+
+    invested_usd * (realized_pnl_usd / total_bought_usd)
+}
+
 fn oldest_unsettled_db_row(rows: &[DbRow]) -> Option<&DbRow> {
     rows.iter().filter(|r| !r.settled).min_by_key(|r| r.id)
 }
@@ -1977,7 +2292,8 @@ fn settle_open_movements_from_closed_positions(
     state: &mut CopyState,
     closed_positions: &[polymarket_client_sdk::data::types::response::ClosedPosition],
 ) -> Vec<MovementRecord> {
-    let mut by_slug: HashMap<String, VecDeque<(i64, Decimal, String)>> = HashMap::new();
+    type ClosedEntry = (i64, Decimal, Decimal, String);
+    let mut by_market_outcome: HashMap<(String, String), VecDeque<ClosedEntry>> = HashMap::new();
     let mut closed_sorted = closed_positions.to_vec();
     closed_sorted.sort_by_key(|c| c.timestamp);
 
@@ -1985,19 +2301,27 @@ fn settle_open_movements_from_closed_positions(
         if closed.total_bought <= Decimal::ZERO {
             continue;
         }
-        let roi = closed.realized_pnl / closed.total_bought;
+        let realized_pnl = closed.realized_pnl;
+        let total_bought = closed.total_bought;
         let normalized = normalize_market_slug(&closed.slug);
-        by_slug.entry(closed.slug.clone()).or_default().push_back((
+        let key_exact = (closed.slug.clone(), closed.outcome.clone());
+        by_market_outcome.entry(key_exact).or_default().push_back((
             closed.timestamp,
-            roi,
+            total_bought,
+            realized_pnl,
             closed.outcome.clone(),
         ));
         if normalized != closed.slug {
-            by_slug.entry(normalized).or_default().push_back((
-                closed.timestamp,
-                roi,
-                closed.outcome.clone(),
-            ));
+            let key_normalized = (normalized, closed.outcome.clone());
+            by_market_outcome
+                .entry(key_normalized)
+                .or_default()
+                .push_back((
+                    closed.timestamp,
+                    total_bought,
+                    realized_pnl,
+                    closed.outcome.clone(),
+                ));
         }
     }
 
@@ -2009,7 +2333,7 @@ fn settle_open_movements_from_closed_positions(
             continue;
         };
 
-        let mut pop_eligible_roi = |q: &mut VecDeque<(i64, Decimal, String)>| {
+        let mut pop_eligible_roi = |q: &mut VecDeque<ClosedEntry>| {
             if q.is_empty() {
                 return None;
             }
@@ -2018,30 +2342,48 @@ fn settle_open_movements_from_closed_positions(
             // or closures with unknown timestamp (0) which we consider usable.
             if let Some(idx) = q
                 .iter()
-                .position(|(ts, _, _)| *ts == 0 || *ts >= movement_ts)
+                .position(|(ts, _, _, _)| *ts == 0 || *ts >= movement_ts)
             {
-                return q.remove(idx).map(|(_, roi, outcome)| (roi, outcome));
+                return q
+                    .remove(idx)
+                    .map(|(_, total_bought, realized_pnl, outcome)| {
+                        (total_bought, realized_pnl, outcome)
+                    });
             }
 
             // Fallback: some Data API responses can carry stale/legacy timestamps.
             // In that case, consume oldest closure to avoid movements stuck forever.
-            q.pop_front().map(|(_, roi, outcome)| (roi, outcome))
+            q.pop_front()
+                .map(|(_, total_bought, realized_pnl, outcome)| {
+                    (total_bought, realized_pnl, outcome)
+                })
         };
 
-        let roi_and_outcome = by_slug
-            .get_mut(movement.market.as_str())
+        let outcome = movement.outcome.clone();
+        let key_exact = (movement.market.clone(), outcome.clone());
+        let key_normalized = (normalized_market, outcome);
+
+        let roi_and_outcome = by_market_outcome
+            .get_mut(&key_exact)
             .and_then(&mut pop_eligible_roi)
             .or_else(|| {
-                by_slug
-                    .get_mut(normalized_market.as_str())
+                by_market_outcome
+                    .get_mut(&key_normalized)
                     .and_then(&mut pop_eligible_roi)
             });
 
-        let Some((roi, resolved_outcome)) = roi_and_outcome else {
+        let Some((total_bought, realized_pnl, resolved_outcome)) = roi_and_outcome else {
             continue;
         };
 
-        movement.pnl = movement.copied_value * roi;
+        movement.pnl = calculate_settlement_pnl_from_invested(
+            movement.copied_value,
+            total_bought,
+            realized_pnl,
+        );
+        if movement.copy_side.eq_ignore_ascii_case("buy") {
+            movement.copy_side = "sell".to_string();
+        }
         movement.resolved_outcome = resolved_outcome;
         movement.settled = true;
         settled.push(movement.clone());
@@ -2545,6 +2887,103 @@ mod tests {
     }
 
     #[test]
+    fn sell_trade_settles_open_buy_with_loss() {
+        let mut state = CopyState {
+            movements: vec![MovementRecord {
+                movement_id: "b1".into(),
+                market: "highest-temperature-in-ankara-on-march-7-2026-3c".into(),
+                timestamp: "2026-03-06T09:00:00Z".into(),
+                leader_value: d("473.90945"),
+                leader_price: d("0.9873113541666668"),
+                copied_value: d("98.49152826961924982793805508"),
+                simulated_copy_price: d("0.999"),
+                quantity: d("480"),
+                copy_side: "buy".into(),
+                outcome: "No".into(),
+                resolved_outcome: String::new(),
+                diff_pct: Decimal::ZERO,
+                estimated_total_fee_usd: Decimal::ZERO,
+                settled: false,
+                pnl: Decimal::ZERO,
+            }],
+        };
+
+        let settled = settle_open_buys_from_sell_trade(
+            &mut state,
+            "highest-temperature-in-ankara-on-march-7-2026-3c",
+            "No",
+            d("0.984"),
+        );
+
+        assert_eq!(settled.len(), 1);
+        assert!(state.movements[0].settled);
+        assert_eq!(state.movements[0].copy_side, "sell");
+        assert!(state.movements[0].pnl < Decimal::ZERO);
+    }
+
+    #[test]
+    fn unsettled_market_slugs_normalizes_and_deduplicates() {
+        let state = CopyState {
+            movements: vec![
+                MovementRecord {
+                    movement_id: "1".into(),
+                    market: "btc-updown-5m-1772278200".into(),
+                    timestamp: "2025-01-01T00:00:00Z".into(),
+                    leader_value: d("10"),
+                    leader_price: Decimal::ZERO,
+                    copied_value: d("1"),
+                    simulated_copy_price: Decimal::ZERO,
+                    quantity: Decimal::ZERO,
+                    copy_side: "buy".into(),
+                    outcome: "No".into(),
+                    resolved_outcome: String::new(),
+                    diff_pct: Decimal::ZERO,
+                    estimated_total_fee_usd: Decimal::ZERO,
+                    settled: false,
+                    pnl: Decimal::ZERO,
+                },
+                MovementRecord {
+                    movement_id: "2".into(),
+                    market: "btc-updown-5m-1772278300".into(),
+                    timestamp: "2025-01-01T00:01:00Z".into(),
+                    leader_value: d("10"),
+                    leader_price: Decimal::ZERO,
+                    copied_value: d("1"),
+                    simulated_copy_price: Decimal::ZERO,
+                    quantity: Decimal::ZERO,
+                    copy_side: "buy".into(),
+                    outcome: String::new(),
+                    resolved_outcome: String::new(),
+                    diff_pct: Decimal::ZERO,
+                    estimated_total_fee_usd: Decimal::ZERO,
+                    settled: false,
+                    pnl: Decimal::ZERO,
+                },
+                MovementRecord {
+                    movement_id: "3".into(),
+                    market: "eth-updown-5m-1772278300".into(),
+                    timestamp: "2025-01-01T00:02:00Z".into(),
+                    leader_value: d("10"),
+                    leader_price: Decimal::ZERO,
+                    copied_value: d("1"),
+                    simulated_copy_price: Decimal::ZERO,
+                    quantity: Decimal::ZERO,
+                    copy_side: "buy".into(),
+                    outcome: String::new(),
+                    resolved_outcome: String::new(),
+                    diff_pct: Decimal::ZERO,
+                    estimated_total_fee_usd: Decimal::ZERO,
+                    settled: true,
+                    pnl: Decimal::ZERO,
+                },
+            ],
+        };
+
+        let slugs = unsettled_market_slugs(&state);
+        assert_eq!(slugs, vec!["btc-updown-5m".to_string()]);
+    }
+
+    #[test]
     fn oldest_unsettled_db_row_selects_lowest_id_not_settled() {
         let rows = vec![
             DbRow {
@@ -2609,6 +3048,12 @@ mod tests {
     }
 
     #[test]
+    fn settlement_pnl_is_scaled_by_invested_amount() {
+        let pnl = calculate_settlement_pnl_from_invested(d("25"), d("100"), d("15"));
+        assert_eq!(pnl, d("3.75"));
+    }
+
+    #[test]
     fn settle_open_movements_uses_position_roi_sequence_and_keeps_negative_pnl() {
         use polymarket_client_sdk::data::types::response::ClosedPosition;
 
@@ -2624,8 +3069,8 @@ mod tests {
                     simulated_copy_price: Decimal::ZERO,
                     quantity: Decimal::ZERO,
                     copy_side: "unknown".into(),
-                    outcome: String::new(),
-                    resolved_outcome: String::new(),
+                    outcome: "Yes".into(),
+                    resolved_outcome: String::new().into(),
                     diff_pct: Decimal::ZERO,
                     estimated_total_fee_usd: Decimal::ZERO,
                     settled: false,
@@ -2641,7 +3086,7 @@ mod tests {
                     simulated_copy_price: Decimal::ZERO,
                     quantity: Decimal::ZERO,
                     copy_side: "unknown".into(),
-                    outcome: String::new(),
+                    outcome: "No".into(),
                     resolved_outcome: String::new(),
                     diff_pct: Decimal::ZERO,
                     estimated_total_fee_usd: Decimal::ZERO,
@@ -2697,6 +3142,104 @@ mod tests {
         assert_eq!(settled.len(), 2);
         assert_eq!(state.movements[0].pnl, d("-2"));
         assert_eq!(state.movements[1].pnl, d("1.6"));
+    }
+
+    #[test]
+    fn settle_matches_closed_positions_by_slug_and_outcome() {
+        use polymarket_client_sdk::data::types::response::ClosedPosition;
+
+        let mut state = CopyState {
+            movements: vec![
+                MovementRecord {
+                    movement_id: "yes-mov".into(),
+                    market: "btc-updown-5m-1772278200".into(),
+                    timestamp: "2025-01-01T00:00:00Z".into(),
+                    leader_value: d("100"),
+                    leader_price: Decimal::ZERO,
+                    copied_value: d("10"),
+                    simulated_copy_price: Decimal::ZERO,
+                    quantity: Decimal::ZERO,
+                    copy_side: "buy".into(),
+                    outcome: "Yes".into(),
+                    resolved_outcome: String::new(),
+                    diff_pct: Decimal::ZERO,
+                    estimated_total_fee_usd: Decimal::ZERO,
+                    settled: false,
+                    pnl: Decimal::ZERO,
+                },
+                MovementRecord {
+                    movement_id: "no-mov".into(),
+                    market: "btc-updown-5m-1772278300".into(),
+                    timestamp: "2025-01-01T00:01:00Z".into(),
+                    leader_value: d("100"),
+                    leader_price: Decimal::ZERO,
+                    copied_value: d("10"),
+                    simulated_copy_price: Decimal::ZERO,
+                    quantity: Decimal::ZERO,
+                    copy_side: "buy".into(),
+                    outcome: "No".into(),
+                    resolved_outcome: String::new(),
+                    diff_pct: Decimal::ZERO,
+                    estimated_total_fee_usd: Decimal::ZERO,
+                    settled: false,
+                    pnl: Decimal::ZERO,
+                },
+            ],
+        };
+
+        // Closed positions come in opposite outcome order vs movements.
+        let closed: Vec<ClosedPosition> = serde_json::from_value(serde_json::json!([
+            {
+                "proxyWallet": "0x0000000000000000000000000000000000000001",
+                "asset": "1",
+                "conditionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "avgPrice": "0.5",
+                "totalBought": "10",
+                "realizedPnl": "5",
+                "curPrice": "0",
+                "timestamp": 1735689660,
+                "title": "t",
+                "slug": "btc-updown-5m",
+                "icon": "",
+                "eventSlug": "e",
+                "outcome": "No",
+                "outcomeIndex": 1,
+                "oppositeOutcome": "Yes",
+                "oppositeAsset": "2",
+                "endDate": "2025-01-01T00:00:00Z"
+            },
+            {
+                "proxyWallet": "0x0000000000000000000000000000000000000001",
+                "asset": "3",
+                "conditionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "avgPrice": "0.5",
+                "totalBought": "10",
+                "realizedPnl": "-2",
+                "curPrice": "0",
+                "timestamp": 1735689720,
+                "title": "t",
+                "slug": "btc-updown-5m",
+                "icon": "",
+                "eventSlug": "e",
+                "outcome": "Yes",
+                "outcomeIndex": 0,
+                "oppositeOutcome": "No",
+                "oppositeAsset": "4",
+                "endDate": "2025-01-01T00:00:00Z"
+            }
+        ]))
+        .unwrap();
+
+        let settled = settle_open_movements_from_closed_positions(&mut state, &closed);
+        assert_eq!(settled.len(), 2);
+
+        // Must match by outcome, not just slug/order.
+        assert_eq!(state.movements[0].resolved_outcome, "Yes");
+        assert_eq!(state.movements[0].copy_side, "sell");
+        assert_eq!(state.movements[0].pnl, d("-2"));
+        assert_eq!(state.movements[1].resolved_outcome, "No");
+        assert_eq!(state.movements[1].copy_side, "sell");
+        assert_eq!(state.movements[1].pnl, d("5"));
     }
 
     #[test]
@@ -2986,5 +3529,4 @@ mod tests {
         assert_eq!(plan.capped_size, d("120"));
         assert_eq!(plan.available_funds, d("600"));
     }
-
 }
