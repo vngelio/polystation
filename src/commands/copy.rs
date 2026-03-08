@@ -353,6 +353,7 @@ struct RuntimeState {
     market_sync_backoff_sim_ms: u64,
     market_sync_real_in_flight: bool,
     market_sync_sim_in_flight: bool,
+    simulation_bootstrap_done: bool,
 }
 
 const CLOSED_SYNC_BASE_MS: u64 = 30_000;
@@ -454,6 +455,7 @@ async fn run_ui(ui: UiArgs) -> Result<()> {
             market_sync_backoff_sim_ms: MARKET_SYNC_BASE_MS,
             market_sync_real_in_flight: false,
             market_sync_sim_in_flight: false,
+            simulation_bootstrap_done: false,
         })),
     };
 
@@ -599,6 +601,7 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
                     return Ok(());
                 }
                 runtime.monitoring = true;
+                runtime.simulation_bootstrap_done = false;
                 let mode = runtime
                     .config
                     .as_ref()
@@ -1291,6 +1294,44 @@ async fn execute_copy_order_from_trade(
     Ok(())
 }
 
+async fn fetch_trades_paginated(
+    data_client: &polymarket_client_sdk::data::Client,
+    user: alloy::primitives::Address,
+    page_size: i32,
+    max_pages: i32,
+    log_scope: &str,
+) -> Result<Vec<polymarket_client_sdk::data::types::response::Trade>> {
+    let mut offset = 0;
+    let mut out = Vec::new();
+
+    for _ in 0..max_pages {
+        let req = TradesRequest::builder()
+            .user(user)
+            .limit(page_size)
+            .and_then(|b| b.maybe_offset(Some(offset)))
+            .map_err(|e| anyhow!("error construyendo request de trades: {e}"))?
+            .build();
+
+        let batch = tokio::time::timeout(Duration::from_secs(15), data_client.trades(&req))
+            .await
+            .map_err(|_| anyhow!("timeout consultando trades"))??;
+
+        let count = batch.len();
+        out.extend(batch);
+        if count < page_size as usize {
+            break;
+        }
+        offset += page_size;
+    }
+
+    log_copy_event(
+        log_scope,
+        format!("paginación trades completada: {} movimientos", out.len()),
+    );
+
+    Ok(out)
+}
+
 async fn simulation_step(
     app: &UiAppState,
     cfg: &CopyConfig,
@@ -1355,31 +1396,55 @@ async fn simulation_step(
         "sim",
         format!("consultando ultimos movimientos de la cuenta a copiar ({leader})"),
     );
-    let trades_req = TradesRequest::builder().user(leader).limit(20)?.build();
-    let trades = match tokio::time::timeout(
-        Duration::from_secs(15),
-        data_client.trades(&trades_req),
-    )
-    .await
-    {
-        Ok(Ok(trades)) => {
-            log_copy_event(
-                "sim",
-                format!("consulta trades completada: {} movimientos", trades.len()),
-            );
-            trades
+    let bootstrap_needed = {
+        let runtime = app.runtime.lock().await;
+        !runtime.simulation_bootstrap_done
+    };
+
+    let trades = if bootstrap_needed {
+        log_copy_event(
+            "sim",
+            "bootstrap simulación: descargando historial amplio de trades",
+        );
+        match fetch_trades_paginated(data_client, leader, 500, 20, "sim").await {
+            Ok(mut t) => {
+                t.sort_by_key(|x| x.timestamp);
+                let mut runtime = app.runtime.lock().await;
+                runtime.simulation_bootstrap_done = true;
+                t
+            }
+            Err(e) => {
+                let mut runtime = app.runtime.lock().await;
+                runtime.warning = Some(format!(
+                    "Error bootstrap simulación consultando trades: {e}"
+                ));
+                log_copy_event("sim", format!("error bootstrap consultando trades: {e}"));
+                Vec::new()
+            }
         }
-        Ok(Err(e)) => {
-            let mut runtime = app.runtime.lock().await;
-            runtime.warning = Some(format!("Error simulación consultando trades: {e}"));
-            log_copy_event("sim", format!("error consultando trades recientes: {e}"));
-            Vec::new()
-        }
-        Err(_) => {
-            let mut runtime = app.runtime.lock().await;
-            runtime.warning = Some("Timeout simulación consultando trades".to_string());
-            log_copy_event("sim", "timeout consultando ultimos movimientos (15s)");
-            Vec::new()
+    } else {
+        let trades_req = TradesRequest::builder().user(leader).limit(20)?.build();
+        match tokio::time::timeout(Duration::from_secs(15), data_client.trades(&trades_req)).await {
+            Ok(Ok(mut trades)) => {
+                log_copy_event(
+                    "sim",
+                    format!("consulta trades completada: {} movimientos", trades.len()),
+                );
+                trades.sort_by_key(|x| x.timestamp);
+                trades
+            }
+            Ok(Err(e)) => {
+                let mut runtime = app.runtime.lock().await;
+                runtime.warning = Some(format!("Error simulación consultando trades: {e}"));
+                log_copy_event("sim", format!("error consultando trades recientes: {e}"));
+                Vec::new()
+            }
+            Err(_) => {
+                let mut runtime = app.runtime.lock().await;
+                runtime.warning = Some("Timeout simulación consultando trades".to_string());
+                log_copy_event("sim", "timeout consultando ultimos movimientos (15s)");
+                Vec::new()
+            }
         }
     };
 
