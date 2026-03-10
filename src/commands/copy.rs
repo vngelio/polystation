@@ -12,6 +12,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Args, Subcommand, ValueEnum};
+use polymarket_client_sdk::data::types::ActivityType;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -21,7 +22,7 @@ use polymarket_client_sdk::auth::Signer as _;
 use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
 use polymarket_client_sdk::clob::types::{Amount, OrderType, Side as ClobSide};
 use polymarket_client_sdk::data::types::request::{
-    ClosedPositionsRequest, TradesRequest, ValueRequest,
+    ActivityRequest, ClosedPositionsRequest, TradesRequest, ValueRequest,
 };
 use polymarket_client_sdk::gamma::types::request::MarketsRequest;
 
@@ -1729,14 +1730,110 @@ fn apply_settlements_from_closed_positions(
     Ok(())
 }
 
+fn settle_open_buys_from_resolved_markets(
+    state: &mut CopyState,
+    resolved_outcomes: &HashMap<String, String>,
+) -> Vec<MovementRecord> {
+    let mut settled = Vec::new();
+
+    for movement in state.movements.iter_mut().filter(|m| !m.settled) {
+        if !movement.copy_side.eq_ignore_ascii_case("buy") {
+            continue;
+        }
+
+        let normalized_market = normalize_market_slug(&movement.market);
+        let Some(resolved_outcome) = resolved_outcomes.get(&normalized_market) else {
+            continue;
+        };
+
+        let shares = movement_copied_shares(movement);
+        if shares <= Decimal::ZERO {
+            continue;
+        }
+
+        let payout_per_share = if movement.outcome == *resolved_outcome {
+            Decimal::ONE
+        } else {
+            Decimal::ZERO
+        };
+        movement.pnl = (shares * payout_per_share) - movement.copied_value;
+        movement.copy_side = "sell".to_string();
+        movement.resolved_outcome = resolved_outcome.clone();
+        movement.settled = true;
+        settled.push(movement.clone());
+    }
+
+    settled
+}
+
+fn apply_settlements_from_resolved_markets(
+    mode: StorageMode,
+    log_scope: &'static str,
+    resolved_outcomes: &HashMap<String, String>,
+) -> Result<()> {
+    if resolved_outcomes.is_empty() {
+        return Ok(());
+    }
+
+    let mut state = load_state()?;
+    let settled = settle_open_buys_from_resolved_markets(&mut state, resolved_outcomes);
+    if settled.is_empty() {
+        return Ok(());
+    }
+
+    save_state(&state)?;
+    for movement in settled {
+        settle_db_movement(mode, &movement.movement_id, movement.pnl)?;
+        if let Err(e) = append_settlement_log(mode, &movement) {
+            log_copy_event(
+                log_scope,
+                format!("error escribiendo log de settlement: {e}"),
+            );
+        }
+        log_copy_event(
+            log_scope,
+            format!(
+                "resolución de mercado cerró {} (mercado={}, ganador={}, outcome={}) pnl={}",
+                movement.movement_id,
+                movement.market,
+                movement.resolved_outcome,
+                movement.outcome,
+                movement.pnl
+            ),
+        );
+    }
+
+    Ok(())
+}
+
+fn resolved_outcome_from_market(
+    market: &polymarket_client_sdk::gamma::types::response::Market,
+) -> Option<String> {
+    let outcomes = market.outcomes.as_ref()?;
+    let prices = market.outcome_prices.as_ref()?;
+    if outcomes.len() != prices.len() {
+        return None;
+    }
+
+    let resolved_price_threshold = Decimal::from_str_exact("0.999").unwrap_or(Decimal::ONE);
+    for (outcome, price) in outcomes.iter().zip(prices.iter()) {
+        if *price >= resolved_price_threshold {
+            return Some(outcome.clone());
+        }
+    }
+
+    None
+}
+
 async fn fetch_closed_markets_from_gamma(
     slugs: &[String],
     log_scope: &str,
-) -> Result<HashSet<String>> {
+) -> Result<(HashSet<String>, HashMap<String, String>)> {
     const CHUNK_SIZE: usize = 25;
 
     let gamma_client = polymarket_client_sdk::gamma::Client::default();
     let mut closed = HashSet::new();
+    let mut resolved_outcomes = HashMap::new();
 
     for chunk in slugs.chunks(CHUNK_SIZE) {
         let req = MarketsRequest::builder()
@@ -1748,9 +1845,13 @@ async fn fetch_closed_markets_from_gamma(
             .map_err(|_| anyhow!("timeout consultando mercados cerrados"))??;
 
         for market in markets {
-            if market.closed.unwrap_or(false) {
-                if let Some(slug) = market.slug {
-                    closed.insert(normalize_market_slug(&slug));
+            if market.closed.unwrap_or(false)
+                && let Some(slug) = market.slug.as_ref()
+            {
+                let normalized = normalize_market_slug(slug);
+                closed.insert(normalized.clone());
+                if let Some(resolved_outcome) = resolved_outcome_from_market(&market) {
+                    resolved_outcomes.insert(normalized, resolved_outcome);
                 }
             }
         }
@@ -1759,13 +1860,14 @@ async fn fetch_closed_markets_from_gamma(
     log_copy_event(
         log_scope,
         format!(
-            "sync mercado: slugs consultados={}, cerrados_detectados={}",
+            "sync mercado: slugs consultados={}, cerrados_detectados={}, resolucion_detectada={}",
             slugs.len(),
-            closed.len()
+            closed.len(),
+            resolved_outcomes.len()
         ),
     );
 
-    Ok(closed)
+    Ok((closed, resolved_outcomes))
 }
 
 async fn run_market_closed_sync_task(
@@ -1781,7 +1883,7 @@ async fn run_market_closed_sync_task(
             return Ok(());
         }
 
-        let closed_market_slugs =
+        let (closed_market_slugs, resolved_outcomes) =
             fetch_closed_markets_from_gamma(&unsettled_slugs, log_scope).await?;
         if closed_market_slugs.is_empty() {
             return Ok(());
@@ -1806,7 +1908,8 @@ async fn run_market_closed_sync_task(
         let data_client = polymarket_client_sdk::data::Client::default();
         let closed_positions =
             fetch_closed_positions_paginated(&data_client, user, log_scope).await?;
-        apply_settlements_from_closed_positions(mode, log_scope, &closed_positions)
+        apply_settlements_from_closed_positions(mode, log_scope, &closed_positions)?;
+        apply_settlements_from_resolved_markets(mode, log_scope, &resolved_outcomes)
     }
     .await;
 
@@ -1825,6 +1928,135 @@ async fn run_market_closed_sync_task(
         StorageMode::Real => runtime.market_sync_real_in_flight = false,
         StorageMode::Simulation => runtime.market_sync_sim_in_flight = false,
     }
+}
+
+fn settle_open_buys_from_activities(
+    state: &mut CopyState,
+    activities: &[polymarket_client_sdk::data::types::response::Activity],
+) -> Vec<MovementRecord> {
+    let mut settled = Vec::new();
+
+    for a in activities {
+        let is_close_activity =
+            matches!(a.activity_type, ActivityType::Merge | ActivityType::Redeem);
+        if !is_close_activity {
+            continue;
+        }
+
+        let Some(slug) = a.slug.as_ref() else {
+            continue;
+        };
+        let normalized_slug = normalize_market_slug(slug);
+        let activity_outcome = a.outcome.as_deref().unwrap_or("");
+
+        let mut exit_price = a.price.unwrap_or(Decimal::ZERO);
+        if exit_price <= Decimal::ZERO && a.size > Decimal::ZERO && a.usdc_size > Decimal::ZERO {
+            exit_price = a.usdc_size / a.size;
+        }
+
+        for movement in state.movements.iter_mut().filter(|m| !m.settled) {
+            if !movement.copy_side.eq_ignore_ascii_case("buy") {
+                continue;
+            }
+            let movement_norm = normalize_market_slug(&movement.market);
+            if movement.market != *slug && movement_norm != normalized_slug {
+                continue;
+            }
+            if !activity_outcome.is_empty() && movement.outcome != activity_outcome {
+                continue;
+            }
+
+            let entry_price = if movement.simulated_copy_price > Decimal::ZERO {
+                movement.simulated_copy_price
+            } else {
+                movement.leader_price
+            };
+
+            if exit_price > Decimal::ZERO && entry_price > Decimal::ZERO {
+                let roi = (exit_price - entry_price) / entry_price;
+                movement.pnl = movement.copied_value * roi;
+            }
+            movement.copy_side = "sell".to_string();
+            if !activity_outcome.is_empty() {
+                movement.resolved_outcome = activity_outcome.to_string();
+            }
+            movement.settled = true;
+            settled.push(movement.clone());
+        }
+    }
+
+    settled
+}
+
+fn apply_settlements_from_activity(
+    mode: StorageMode,
+    log_scope: &'static str,
+    activities: &[polymarket_client_sdk::data::types::response::Activity],
+) -> Result<()> {
+    let mut state = load_state()?;
+    let settled = settle_open_buys_from_activities(&mut state, activities);
+    if settled.is_empty() {
+        return Ok(());
+    }
+
+    save_state(&state)?;
+    for movement in settled {
+        settle_db_movement(mode, &movement.movement_id, movement.pnl)?;
+        if let Err(e) = append_settlement_log(mode, &movement) {
+            log_copy_event(
+                log_scope,
+                format!("error escribiendo log de settlement: {e}"),
+            );
+        }
+        log_copy_event(
+            log_scope,
+            format!(
+                "actividad on-chain cerró {} (mercado={}, outcome={}) pnl={}",
+                movement.movement_id, movement.market, movement.outcome, movement.pnl
+            ),
+        );
+    }
+
+    Ok(())
+}
+
+async fn fetch_activity_paginated(
+    data_client: &polymarket_client_sdk::data::Client,
+    user: alloy::primitives::Address,
+    log_scope: &str,
+) -> Result<Vec<polymarket_client_sdk::data::types::response::Activity>> {
+    const PAGE_SIZE: i32 = 500;
+    const MAX_PAGES: i32 = 20;
+
+    let mut offset = 0;
+    let mut out = Vec::new();
+    for _ in 0..MAX_PAGES {
+        let req = ActivityRequest::builder()
+            .user(user)
+            .limit(PAGE_SIZE)
+            .map_err(|e| anyhow!("error construyendo limit de activity: {e}"))?
+            .activity_types(vec![ActivityType::Merge, ActivityType::Redeem])
+            .maybe_offset(Some(offset))
+            .map_err(|e| anyhow!("error construyendo offset de activity: {e}"))?
+            .build();
+
+        let batch = tokio::time::timeout(Duration::from_secs(15), data_client.activity(&req))
+            .await
+            .map_err(|_| anyhow!("timeout consultando activity"))??;
+
+        let count = batch.len();
+        out.extend(batch);
+        if count < PAGE_SIZE as usize {
+            break;
+        }
+        offset += PAGE_SIZE;
+    }
+
+    log_copy_event(
+        log_scope,
+        format!("consulta activity merge/redeem completada: {}", out.len()),
+    );
+    Ok(out)
 }
 
 async fn run_closed_sync_task(
@@ -1858,6 +2090,14 @@ async fn run_closed_sync_task(
             } else {
                 let settle_result =
                     apply_settlements_from_closed_positions(mode, log_scope, &closed_positions);
+
+                if settle_result.is_ok() {
+                    if let Ok(activities) =
+                        fetch_activity_paginated(&data_client, user, log_scope).await
+                    {
+                        let _ = apply_settlements_from_activity(mode, log_scope, &activities);
+                    }
+                }
 
                 let mut runtime = app.runtime.lock().await;
                 match settle_result {
@@ -2971,6 +3211,98 @@ mod tests {
             "xrp-updown-5m"
         );
         assert_eq!(normalize_market_slug("btc-updown-1h"), "btc-updown-1h");
+    }
+
+    #[test]
+    fn resolved_market_settlement_marks_losing_buy_as_full_loss() {
+        let mut state = CopyState {
+            movements: vec![MovementRecord {
+                movement_id: "m-loss".into(),
+                market: "highest-temperature-in-lucknow-on-march-8-2026-39c".into(),
+                timestamp: "2026-03-08T10:00:00Z".into(),
+                leader_value: d("39"),
+                leader_price: d("0.999"),
+                copied_value: d("39"),
+                simulated_copy_price: d("0.999"),
+                quantity: d("39"),
+                copy_side: "buy".into(),
+                outcome: "No".into(),
+                resolved_outcome: String::new(),
+                diff_pct: Decimal::ZERO,
+                estimated_total_fee_usd: Decimal::ZERO,
+                settled: false,
+                pnl: Decimal::ZERO,
+            }],
+        };
+
+        let resolved_outcomes = HashMap::from([(
+            "highest-temperature-in-lucknow-on-march-8-2026-39c".to_string(),
+            "Yes".to_string(),
+        )]);
+
+        let settled = settle_open_buys_from_resolved_markets(&mut state, &resolved_outcomes);
+        assert_eq!(settled.len(), 1);
+        assert!(state.movements[0].settled);
+        assert_eq!(state.movements[0].resolved_outcome, "Yes");
+        assert_eq!(state.movements[0].copy_side, "sell");
+        assert_eq!(state.movements[0].pnl, d("-39"));
+    }
+
+    #[test]
+    fn merge_or_redeem_activity_settles_matching_open_buy() {
+        use polymarket_client_sdk::data::types::response::Activity;
+
+        let mut state = CopyState {
+            movements: vec![MovementRecord {
+                movement_id: "m-1".into(),
+                market: "highest-temperature-in-lucknow-on-march-5-2026-40c".into(),
+                timestamp: "2026-03-05T10:00:00Z".into(),
+                leader_value: d("100"),
+                leader_price: d("0.6"),
+                copied_value: d("50"),
+                simulated_copy_price: d("0.6"),
+                quantity: d("80"),
+                copy_side: "buy".into(),
+                outcome: "No".into(),
+                resolved_outcome: String::new(),
+                diff_pct: Decimal::ZERO,
+                estimated_total_fee_usd: Decimal::ZERO,
+                settled: false,
+                pnl: Decimal::ZERO,
+            }],
+        };
+
+        let activities: Vec<Activity> = serde_json::from_value(serde_json::json!([
+            {
+                "proxyWallet": "0x0000000000000000000000000000000000000001",
+                "timestamp": 1772802272,
+                "conditionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "type": "MERGE",
+                "size": "80",
+                "usdcSize": "48",
+                "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000011",
+                "price": "0.6",
+                "asset": "1",
+                "side": "SELL",
+                "outcomeIndex": 1,
+                "title": "t",
+                "slug": "highest-temperature-in-lucknow-on-march-5-2026-40c",
+                "icon": "",
+                "eventSlug": "e",
+                "outcome": "No",
+                "name": "",
+                "pseudonym": "",
+                "bio": "",
+                "profileImage": "",
+                "profileImageOptimized": ""
+            }
+        ])).unwrap();
+
+        let settled = settle_open_buys_from_activities(&mut state, &activities);
+        assert_eq!(settled.len(), 1);
+        assert!(state.movements[0].settled);
+        assert_eq!(state.movements[0].copy_side, "sell");
+        assert_eq!(state.movements[0].resolved_outcome, "No");
     }
 
     #[test]
