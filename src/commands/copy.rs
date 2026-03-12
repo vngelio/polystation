@@ -355,12 +355,14 @@ struct RuntimeState {
     market_sync_real_in_flight: bool,
     market_sync_sim_in_flight: bool,
     simulation_bootstrap_done: bool,
+    simulation_bootstrap_next_retry_at_ms: i64,
 }
 
 const CLOSED_SYNC_BASE_MS: u64 = 30_000;
 const CLOSED_SYNC_MAX_BACKOFF_MS: u64 = 30_000;
 const MARKET_SYNC_BASE_MS: u64 = 30_000;
 const MARKET_SYNC_MAX_BACKOFF_MS: u64 = 120_000;
+const SIM_BOOTSTRAP_RETRY_MS: u64 = 300_000;
 
 #[derive(Serialize)]
 struct UiStateResponse {
@@ -457,6 +459,7 @@ async fn run_ui(ui: UiArgs) -> Result<()> {
             market_sync_real_in_flight: false,
             market_sync_sim_in_flight: false,
             simulation_bootstrap_done: false,
+            simulation_bootstrap_next_retry_at_ms: 0,
         })),
     };
 
@@ -603,6 +606,7 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
                 }
                 runtime.monitoring = true;
                 runtime.simulation_bootstrap_done = false;
+                runtime.simulation_bootstrap_next_retry_at_ms = 0;
                 let mode = runtime
                     .config
                     .as_ref()
@@ -1302,18 +1306,32 @@ async fn fetch_trades_paginated(
     max_pages: i32,
     log_scope: &str,
 ) -> Result<Vec<polymarket_client_sdk::data::types::response::Trade>> {
+    const MAX_TRADES_OFFSET: i32 = 3000;
+
     let mut offset = 0;
     let mut out = Vec::new();
 
     for _ in 0..max_pages {
+        if offset > MAX_TRADES_OFFSET {
+            log_copy_event(
+                log_scope,
+                format!(
+                    "paginación trades detenida por límite de offset de API (offset={}, max={})",
+                    offset, MAX_TRADES_OFFSET
+                ),
+            );
+            break;
+        }
+
         let req = TradesRequest::builder()
             .user(user)
             .limit(page_size)
-            .and_then(|b| b.maybe_offset(Some(offset)))
-            .map_err(|e| anyhow!("error construyendo request de trades: {e}"))?
+            .map_err(|e| anyhow!("error construyendo limit de trades: {e}"))?
+            .maybe_offset(Some(offset))
+            .map_err(|e| anyhow!("error construyendo offset de trades: {e}"))?
             .build();
 
-        let batch = tokio::time::timeout(Duration::from_secs(15), data_client.trades(&req))
+        let batch = tokio::time::timeout(Duration::from_secs(8), data_client.trades(&req))
             .await
             .map_err(|_| anyhow!("timeout consultando trades"))??;
 
@@ -1322,6 +1340,19 @@ async fn fetch_trades_paginated(
         if count < page_size as usize {
             break;
         }
+
+        if offset + page_size > MAX_TRADES_OFFSET {
+            log_copy_event(
+                log_scope,
+                format!(
+                    "paginación trades alcanzó último offset permitido (offset={}, page_size={}, max={})",
+                    offset, page_size, MAX_TRADES_OFFSET
+                ),
+            );
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
         offset += page_size;
     }
 
@@ -1400,14 +1431,15 @@ async fn simulation_step(
     let bootstrap_needed = {
         let runtime = app.runtime.lock().await;
         !runtime.simulation_bootstrap_done
+            && closed_sync_due(runtime.simulation_bootstrap_next_retry_at_ms)
     };
 
     let trades = if bootstrap_needed {
         log_copy_event(
             "sim",
-            "bootstrap simulación: descargando historial amplio de trades",
+            "bootstrap simulación: descargando historial acotado de trades para evitar throttle",
         );
-        match fetch_trades_paginated(data_client, leader, 500, 20, "sim").await {
+        match fetch_trades_paginated(data_client, leader, 200, 6, "sim").await {
             Ok(mut t) => {
                 t.sort_by_key(|x| x.timestamp);
                 let mut runtime = app.runtime.lock().await;
@@ -1419,7 +1451,15 @@ async fn simulation_step(
                 runtime.warning = Some(format!(
                     "Error bootstrap simulación consultando trades: {e}"
                 ));
-                log_copy_event("sim", format!("error bootstrap consultando trades: {e}"));
+                runtime.simulation_bootstrap_next_retry_at_ms =
+                    now_ms() + i64::try_from(SIM_BOOTSTRAP_RETRY_MS).unwrap_or(300_000);
+                log_copy_event(
+                    "sim",
+                    format!(
+                        "error bootstrap consultando trades: {e}; próximo reintento en ~{}s",
+                        SIM_BOOTSTRAP_RETRY_MS / 1000
+                    ),
+                );
                 Vec::new()
             }
         }
