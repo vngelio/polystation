@@ -340,7 +340,8 @@ struct RuntimeState {
     monitoring: bool,
     current_poll_interval_ms: u64,
     warning: Option<String>,
-    last_seen_hashes: HashSet<String>,
+    last_seen_trade_keys_real: HashSet<String>,
+    last_seen_trade_keys_sim: HashSet<String>,
     simulation_tick: u64,
     next_closed_sync_real_at_ms: i64,
     next_closed_sync_sim_at_ms: i64,
@@ -444,7 +445,8 @@ async fn run_ui(ui: UiArgs) -> Result<()> {
                 .map(|c| normalize_poll_ms(c.poll_interval_ms, c.realtime_mode, c.simulation_mode))
                 .unwrap_or(default_poll_interval_ms()),
             warning: None,
-            last_seen_hashes: HashSet::new(),
+            last_seen_trade_keys_real: HashSet::new(),
+            last_seen_trade_keys_sim: HashSet::new(),
             simulation_tick: 0,
             next_closed_sync_real_at_ms: 0,
             next_closed_sync_sim_at_ms: 0,
@@ -607,6 +609,8 @@ async fn handle_http(mut stream: TcpStream, app: UiAppState, token: &str) -> Res
                 runtime.monitoring = true;
                 runtime.simulation_bootstrap_done = false;
                 runtime.simulation_bootstrap_next_retry_at_ms = 0;
+                runtime.last_seen_trade_keys_real.clear();
+                runtime.last_seen_trade_keys_sim.clear();
                 let mode = runtime
                     .config
                     .as_ref()
@@ -980,21 +984,46 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 }
             };
 
+        let prime_only = {
+            let mut runtime = app.runtime.lock().await;
+            if runtime.last_seen_trade_keys_real.is_empty() {
+                for t in &trades {
+                    runtime.last_seen_trade_keys_real.insert(trade_event_key(t));
+                }
+                true
+            } else {
+                false
+            }
+        };
+
+        if prime_only {
+            log_copy_event(
+                "real",
+                format!(
+                    "primer barrido: {} trades marcados como vistos (sin copiar histórico)",
+                    trades.len()
+                ),
+            );
+            return Ok(());
+        }
+
         for t in trades {
             let tx_hash = t.transaction_hash.to_string();
+            let trade_key = trade_event_key(&t);
+            let movement_id = format!("real-{trade_key}");
             let is_sell = t.side.to_string().eq_ignore_ascii_case("sell");
             {
                 let mut runtime = app.runtime.lock().await;
-                if runtime.last_seen_hashes.contains(&tx_hash) {
+                if runtime.last_seen_trade_keys_real.contains(&trade_key) {
                     continue;
                 }
                 if !is_sell {
-                    runtime.last_seen_hashes.insert(tx_hash.clone());
+                    runtime.last_seen_trade_keys_real.insert(trade_key.clone());
                 }
             }
 
             let mut state = load_state()?;
-            if state.movements.iter().any(|m| m.movement_id == tx_hash) {
+            if state.movements.iter().any(|m| m.movement_id == movement_id) {
                 continue;
             }
 
@@ -1024,7 +1053,7 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                         );
                     }
                     let mut runtime = app.runtime.lock().await;
-                    runtime.last_seen_hashes.insert(tx_hash.clone());
+                    runtime.last_seen_trade_keys_real.insert(trade_key.clone());
                     continue;
                 }
             }
@@ -1198,7 +1227,7 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             }
 
             let record = MovementRecord {
-                movement_id: tx_hash.clone(),
+                movement_id: movement_id.clone(),
                 market: t.slug,
                 timestamp: Utc::now().to_rfc3339(),
                 leader_value: t.size * t.price,
@@ -1222,7 +1251,7 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
             append_db_movement(StorageMode::Real, &record)?;
             if is_sell {
                 let mut runtime = app.runtime.lock().await;
-                runtime.last_seen_hashes.insert(tx_hash.clone());
+                runtime.last_seen_trade_keys_real.insert(trade_key.clone());
             }
             if cfg.execute_orders {
                 log_copy_event(
@@ -1489,21 +1518,45 @@ async fn simulation_step(
         }
     };
 
+    let prime_only = {
+        let mut runtime = app.runtime.lock().await;
+        if runtime.last_seen_trade_keys_sim.is_empty() {
+            for t in &trades {
+                runtime.last_seen_trade_keys_sim.insert(trade_event_key(t));
+            }
+            true
+        } else {
+            false
+        }
+    };
+
+    if prime_only {
+        log_copy_event(
+            "sim",
+            format!(
+                "primer barrido sim: {} trades marcados como vistos (sin copiar histórico)",
+                trades.len()
+            ),
+        );
+        return Ok(());
+    }
+
     for t in trades {
         let tx_hash = t.transaction_hash.to_string();
+        let trade_key = trade_event_key(&t);
         let is_sell = t.side.to_string().eq_ignore_ascii_case("sell");
         {
             let mut runtime = app.runtime.lock().await;
-            if runtime.last_seen_hashes.contains(&tx_hash) {
+            if runtime.last_seen_trade_keys_sim.contains(&trade_key) {
                 continue;
             }
             if !is_sell {
-                runtime.last_seen_hashes.insert(tx_hash.clone());
+                runtime.last_seen_trade_keys_sim.insert(trade_key.clone());
             }
         }
 
         let mut state = load_state()?;
-        let movement_id = format!("sim-{tx_hash}");
+        let movement_id = format!("sim-{trade_key}");
         if state.movements.iter().any(|m| m.movement_id == movement_id) {
             continue;
         }
@@ -1535,7 +1588,7 @@ async fn simulation_step(
                     );
                 }
                 let mut runtime = app.runtime.lock().await;
-                runtime.last_seen_hashes.insert(tx_hash.clone());
+                runtime.last_seen_trade_keys_sim.insert(trade_key.clone());
                 continue;
             }
         }
@@ -1689,7 +1742,7 @@ async fn simulation_step(
         append_db_movement(StorageMode::Simulation, &record)?;
         if is_sell {
             let mut runtime = app.runtime.lock().await;
-            runtime.last_seen_hashes.insert(tx_hash.clone());
+            runtime.last_seen_trade_keys_sim.insert(trade_key.clone());
         }
         log_copy_event(
             "sim",
@@ -2463,6 +2516,20 @@ fn copied_shares_from_notional(notional_usd: Decimal, price: Decimal) -> Decimal
     notional_usd / price
 }
 
+fn trade_event_key(trade: &polymarket_client_sdk::data::types::response::Trade) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}",
+        trade.transaction_hash,
+        trade.asset,
+        trade.side,
+        trade.outcome,
+        trade.slug,
+        trade.timestamp,
+        trade.size,
+        trade.price,
+    )
+}
+
 fn movement_copied_shares(m: &MovementRecord) -> Decimal {
     let px = if m.simulated_copy_price > Decimal::ZERO {
         m.simulated_copy_price
@@ -2566,8 +2633,11 @@ fn compute_plan(
     let ratio = effective_funds / leader_positions_value;
     let proportional = leader_movement_value * ratio;
 
-    let max_trade = effective_funds * (cfg.max_trade_pct / Decimal::from(100));
-    let max_total_exposure = effective_funds * (cfg.max_total_exposure_pct / Decimal::from(100));
+    let safe_max_trade_pct = cfg.max_trade_pct.min(Decimal::from(100));
+    let safe_max_total_exposure_pct = cfg.max_total_exposure_pct.min(Decimal::from(100));
+
+    let max_trade = effective_funds * (safe_max_trade_pct / Decimal::from(100));
+    let max_total_exposure = effective_funds * (safe_max_total_exposure_pct / Decimal::from(100));
     let used_exposure: Decimal = state
         .movements
         .iter()
