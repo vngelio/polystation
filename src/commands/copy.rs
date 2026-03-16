@@ -1033,7 +1033,7 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 if !settled_from_sell.is_empty() {
                     save_state(&state)?;
                     for movement in settled_from_sell {
-                        settle_db_movement(StorageMode::Real, &movement.movement_id, movement.pnl)?;
+                        settle_db_movement_from_record(StorageMode::Real, &movement)?;
                         if let Err(e) = append_settlement_log(StorageMode::Real, &movement) {
                             log_copy_event(
                                 "real",
@@ -1567,11 +1567,7 @@ async fn simulation_step(
             if !settled_from_sell.is_empty() {
                 save_state(&state)?;
                 for movement in settled_from_sell {
-                    settle_db_movement(
-                        StorageMode::Simulation,
-                        &movement.movement_id,
-                        movement.pnl,
-                    )?;
+                    settle_db_movement_from_record(StorageMode::Simulation, &movement)?;
                     if let Err(e) = append_settlement_log(StorageMode::Simulation, &movement) {
                         log_copy_event("sim", format!("error escribiendo log de settlement: {e}"));
                     }
@@ -1810,7 +1806,7 @@ fn apply_settlements_from_closed_positions(
                     movement.movement_id, movement.market, movement.pnl
                 ),
             );
-            settle_db_movement(mode, &movement.movement_id, movement.pnl)?;
+            settle_db_movement_from_record(mode, &movement)?;
             if let Err(e) = append_settlement_log(mode, &movement) {
                 log_copy_event(
                     log_scope,
@@ -1876,7 +1872,7 @@ fn apply_settlements_from_resolved_markets(
 
     save_state(&state)?;
     for movement in settled {
-        settle_db_movement(mode, &movement.movement_id, movement.pnl)?;
+        settle_db_movement_from_record(mode, &movement)?;
         if let Err(e) = append_settlement_log(mode, &movement) {
             log_copy_event(
                 log_scope,
@@ -2094,7 +2090,7 @@ fn apply_settlements_from_activity(
 
     save_state(&state)?;
     for movement in settled {
-        settle_db_movement(mode, &movement.movement_id, movement.pnl)?;
+        settle_db_movement_from_record(mode, &movement)?;
         if let Err(e) = append_settlement_log(mode, &movement) {
             log_copy_event(
                 log_scope,
@@ -3009,14 +3005,42 @@ fn append_db_movement(mode: StorageMode, m: &MovementRecord) -> Result<()> {
     write_db_rows(mode, &rows)
 }
 
-fn settle_db_movement(mode: StorageMode, movement_id: &str, pnl: Decimal) -> Result<()> {
-    let mut rows = read_db_rows(mode)?;
-    for r in &mut rows {
+fn apply_settlement_to_db_rows(
+    rows: &mut [DbRow],
+    movement_id: &str,
+    pnl: Decimal,
+    copy_side: Option<&str>,
+    resolved_outcome: Option<&str>,
+) {
+    for r in rows {
         if r.movement_id == movement_id {
             r.settled = true;
             r.pnl = pnl.to_string();
+            if let Some(side) = copy_side {
+                r.copy_side = side.to_string();
+            }
+            if let Some(outcome) = resolved_outcome {
+                r.resolved_outcome = outcome.to_string();
+            }
         }
     }
+}
+
+fn settle_db_movement(mode: StorageMode, movement_id: &str, pnl: Decimal) -> Result<()> {
+    let mut rows = read_db_rows(mode)?;
+    apply_settlement_to_db_rows(&mut rows, movement_id, pnl, None, None);
+    write_db_rows(mode, &rows)
+}
+
+fn settle_db_movement_from_record(mode: StorageMode, movement: &MovementRecord) -> Result<()> {
+    let mut rows = read_db_rows(mode)?;
+    apply_settlement_to_db_rows(
+        &mut rows,
+        &movement.movement_id,
+        movement.pnl,
+        Some(&movement.copy_side),
+        Some(&movement.resolved_outcome),
+    );
     write_db_rows(mode, &rows)
 }
 
@@ -3608,6 +3632,35 @@ mod tests {
         let oldest = oldest_unsettled_db_row(&rows).expect("expected oldest unsettled row");
         assert_eq!(oldest.id, 2);
         assert_eq!(oldest.movement_id, "b");
+    }
+
+    #[test]
+    fn apply_settlement_to_db_rows_updates_side_and_resolved_outcome() {
+        let mut rows = vec![DbRow {
+            id: 1,
+            movement_id: "m1".into(),
+            market: "mkt".into(),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            leader_value: "10".into(),
+            leader_price: "0.5".into(),
+            copied_value: "5".into(),
+            simulated_copy_price: "0.5".into(),
+            quantity: "10".into(),
+            copy_side: "buy".into(),
+            outcome: "Yes".into(),
+            resolved_outcome: String::new(),
+            diff_pct: "0".into(),
+            estimated_total_fee_usd: "0".into(),
+            settled: false,
+            pnl: "0".into(),
+        }];
+
+        apply_settlement_to_db_rows(&mut rows, "m1", d("-5"), Some("sell"), Some("No"));
+
+        assert!(rows[0].settled);
+        assert_eq!(rows[0].pnl, "-5");
+        assert_eq!(rows[0].copy_side, "sell");
+        assert_eq!(rows[0].resolved_outcome, "No");
     }
 
     #[test]
