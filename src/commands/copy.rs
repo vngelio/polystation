@@ -412,6 +412,10 @@ struct DbMovement {
     diff_pct: String,
     #[serde(default)]
     estimated_total_fee_usd: String,
+    #[serde(default)]
+    close_reason: String,
+    #[serde(default)]
+    close_price: String,
     settled: bool,
     pnl: String,
 }
@@ -1033,7 +1037,12 @@ async fn monitor_loop(app: UiAppState) -> Result<()> {
                 if !settled_from_sell.is_empty() {
                     save_state(&state)?;
                     for movement in settled_from_sell {
-                        settle_db_movement_from_record(StorageMode::Real, &movement)?;
+                        settle_db_movement_from_record(
+                            StorageMode::Real,
+                            &movement,
+                            "leader_sell",
+                            Some(t.price),
+                        )?;
                         if let Err(e) = append_settlement_log(StorageMode::Real, &movement) {
                             log_copy_event(
                                 "real",
@@ -1567,7 +1576,12 @@ async fn simulation_step(
             if !settled_from_sell.is_empty() {
                 save_state(&state)?;
                 for movement in settled_from_sell {
-                    settle_db_movement_from_record(StorageMode::Simulation, &movement)?;
+                    settle_db_movement_from_record(
+                        StorageMode::Simulation,
+                        &movement,
+                        "leader_sell",
+                        Some(t.price),
+                    )?;
                     if let Err(e) = append_settlement_log(StorageMode::Simulation, &movement) {
                         log_copy_event("sim", format!("error escribiendo log de settlement: {e}"));
                     }
@@ -1806,7 +1820,12 @@ fn apply_settlements_from_closed_positions(
                     movement.movement_id, movement.market, movement.pnl
                 ),
             );
-            settle_db_movement_from_record(mode, &movement)?;
+            settle_db_movement_from_record(
+                mode,
+                &movement,
+                "closed_positions",
+                implied_close_price_from_movement(&movement),
+            )?;
             if let Err(e) = append_settlement_log(mode, &movement) {
                 log_copy_event(
                     log_scope,
@@ -1872,7 +1891,7 @@ fn apply_settlements_from_resolved_markets(
 
     save_state(&state)?;
     for movement in settled {
-        settle_db_movement_from_record(mode, &movement)?;
+        settle_db_movement_from_record(mode, &movement, "resolved_market", None)?;
         if let Err(e) = append_settlement_log(mode, &movement) {
             log_copy_event(
                 log_scope,
@@ -2090,7 +2109,7 @@ fn apply_settlements_from_activity(
 
     save_state(&state)?;
     for movement in settled {
-        settle_db_movement_from_record(mode, &movement)?;
+        settle_db_movement_from_record(mode, &movement, "activity_merge_redeem", None)?;
         if let Err(e) = append_settlement_log(mode, &movement) {
             log_copy_event(
                 log_scope,
@@ -2535,6 +2554,20 @@ fn movement_copied_shares(m: &MovementRecord) -> Decimal {
     copied_shares_from_notional(m.copied_value, px)
 }
 
+fn implied_close_price_from_movement(movement: &MovementRecord) -> Option<Decimal> {
+    let entry_price = if movement.simulated_copy_price > Decimal::ZERO {
+        movement.simulated_copy_price
+    } else {
+        movement.leader_price
+    };
+    if entry_price <= Decimal::ZERO || movement.copied_value <= Decimal::ZERO {
+        return None;
+    }
+
+    let roi = movement.pnl / movement.copied_value;
+    Some(entry_price * (Decimal::ONE + roi))
+}
+
 fn settle_open_buys_from_sell_trade(
     state: &mut CopyState,
     market: &str,
@@ -2948,6 +2981,10 @@ struct DbRow {
     diff_pct: String,
     #[serde(default)]
     estimated_total_fee_usd: String,
+    #[serde(default)]
+    close_reason: String,
+    #[serde(default)]
+    close_price: String,
     settled: bool,
     pnl: String,
 }
@@ -2999,6 +3036,8 @@ fn append_db_movement(mode: StorageMode, m: &MovementRecord) -> Result<()> {
         resolved_outcome: m.resolved_outcome.clone(),
         diff_pct: m.diff_pct.to_string(),
         estimated_total_fee_usd: m.estimated_total_fee_usd.to_string(),
+        close_reason: String::new(),
+        close_price: Decimal::ZERO.to_string(),
         settled: m.settled,
         pnl: m.pnl.to_string(),
     });
@@ -3011,6 +3050,8 @@ fn apply_settlement_to_db_rows(
     pnl: Decimal,
     copy_side: Option<&str>,
     resolved_outcome: Option<&str>,
+    close_reason: Option<&str>,
+    close_price: Option<Decimal>,
 ) {
     for r in rows {
         if r.movement_id == movement_id {
@@ -3022,17 +3063,36 @@ fn apply_settlement_to_db_rows(
             if let Some(outcome) = resolved_outcome {
                 r.resolved_outcome = outcome.to_string();
             }
+            if let Some(reason) = close_reason {
+                r.close_reason = reason.to_string();
+            }
+            if let Some(price) = close_price {
+                r.close_price = price.to_string();
+            }
         }
     }
 }
 
 fn settle_db_movement(mode: StorageMode, movement_id: &str, pnl: Decimal) -> Result<()> {
     let mut rows = read_db_rows(mode)?;
-    apply_settlement_to_db_rows(&mut rows, movement_id, pnl, None, None);
+    apply_settlement_to_db_rows(
+        &mut rows,
+        movement_id,
+        pnl,
+        None,
+        None,
+        Some("manual_settle"),
+        None,
+    );
     write_db_rows(mode, &rows)
 }
 
-fn settle_db_movement_from_record(mode: StorageMode, movement: &MovementRecord) -> Result<()> {
+fn settle_db_movement_from_record(
+    mode: StorageMode,
+    movement: &MovementRecord,
+    close_reason: &'static str,
+    close_price: Option<Decimal>,
+) -> Result<()> {
     let mut rows = read_db_rows(mode)?;
     apply_settlement_to_db_rows(
         &mut rows,
@@ -3040,6 +3100,8 @@ fn settle_db_movement_from_record(mode: StorageMode, movement: &MovementRecord) 
         movement.pnl,
         Some(&movement.copy_side),
         Some(&movement.resolved_outcome),
+        Some(close_reason),
+        close_price,
     );
     write_db_rows(mode, &rows)
 }
@@ -3093,6 +3155,8 @@ fn db_updates_since(mode: StorageMode, since: i64) -> Result<(i64, Vec<DbMovemen
             resolved_outcome: r.resolved_outcome,
             diff_pct: r.diff_pct,
             estimated_total_fee_usd: r.estimated_total_fee_usd,
+            close_reason: r.close_reason,
+            close_price: r.close_price,
             settled: r.settled,
             pnl: r.pnl,
         })
@@ -3588,6 +3652,8 @@ mod tests {
                 resolved_outcome: String::new(),
                 diff_pct: "0".into(),
                 estimated_total_fee_usd: "0".into(),
+                close_reason: String::new(),
+                close_price: "0".into(),
                 settled: false,
                 pnl: "0".into(),
             },
@@ -3606,6 +3672,8 @@ mod tests {
                 resolved_outcome: String::new(),
                 diff_pct: "0".into(),
                 estimated_total_fee_usd: "0".into(),
+                close_reason: String::new(),
+                close_price: "0".into(),
                 settled: true,
                 pnl: "1".into(),
             },
@@ -3624,6 +3692,8 @@ mod tests {
                 resolved_outcome: String::new(),
                 diff_pct: "0".into(),
                 estimated_total_fee_usd: "0".into(),
+                close_reason: String::new(),
+                close_price: "0".into(),
                 settled: false,
                 pnl: "0".into(),
             },
@@ -3651,16 +3721,28 @@ mod tests {
             resolved_outcome: String::new(),
             diff_pct: "0".into(),
             estimated_total_fee_usd: "0".into(),
+            close_reason: String::new(),
+            close_price: "0".into(),
             settled: false,
             pnl: "0".into(),
         }];
 
-        apply_settlement_to_db_rows(&mut rows, "m1", d("-5"), Some("sell"), Some("No"));
+        apply_settlement_to_db_rows(
+            &mut rows,
+            "m1",
+            d("-5"),
+            Some("sell"),
+            Some("No"),
+            Some("leader_sell"),
+            Some(d("0.4")),
+        );
 
         assert!(rows[0].settled);
         assert_eq!(rows[0].pnl, "-5");
         assert_eq!(rows[0].copy_side, "sell");
         assert_eq!(rows[0].resolved_outcome, "No");
+        assert_eq!(rows[0].close_reason, "leader_sell");
+        assert_eq!(rows[0].close_price, "0.4");
     }
 
     #[test]

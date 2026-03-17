@@ -631,7 +631,7 @@ th { position: relative; }
         <thead>
           <tr>
             <th>Hora</th><th>ID mov.</th><th>Mercado</th><th>Lado</th><th>Outcome</th><th>Leader $</th><th>Px leader</th>
-            <th>Invertido $</th><th>Px sim/cop</th><th>Cantidad</th><th>Fees $</th><th>Settled</th><th>Resultado apuesta</th><th>PnL bruto</th><th>Resultado final</th>
+            <th>Invertido $</th><th>Px sim/cop</th><th>Cantidad</th><th>Fees $</th><th>Settled</th><th>Tipo cierre</th><th>Px cierre</th><th>Resultado apuesta</th><th>PnL bruto</th><th>Resultado final</th>
           </tr>
         </thead>
         <tbody id="moves"></tbody>
@@ -959,7 +959,10 @@ function rowHtml(m){
   const copyPx = parseFloat(m.simulated_copy_price || '0');
   const copyPxTxt = (!isNaN(copyPx) && copyPx > 0) ? (m.simulated_copy_price) : '—';
   const resolvedOutcome = isSettled ? (m.resolved_outcome || m.outcome || '—') : '—';
-  return `<td class="ts">${m.timestamp}</td><td>${mid}</td><td class="mkt">${m.market}</td><td>${m.copy_side||"unknown"}</td><td>${m.outcome||"—"}</td><td>${m.leader_value}</td><td>${m.leader_price||"0"}</td><td>${m.copied_value}</td><td>${copyPxTxt}</td><td>${m.quantity||"0"}</td><td>${feesTxt}</td><td>${settledTxt}</td><td>${resolvedOutcome}</td><td class="${grossClass}">${m.pnl}</td><td class="${netClass}">${netTxt}</td>`;
+  const closeReason = isSettled ? (m.close_reason || '—') : '—';
+  const closePx = parseFloat(m.close_price || '0');
+  const closePxTxt = isSettled && !isNaN(closePx) && closePx > 0 ? m.close_price : '—';
+  return `<td class="ts">${m.timestamp}</td><td>${mid}</td><td class="mkt">${m.market}</td><td>${m.copy_side||"unknown"}</td><td>${m.outcome||"—"}</td><td>${m.leader_value}</td><td>${m.leader_price||"0"}</td><td>${m.copied_value}</td><td>${copyPxTxt}</td><td>${m.quantity||"0"}</td><td>${feesTxt}</td><td>${settledTxt}</td><td>${closeReason}</td><td>${closePxTxt}</td><td>${resolvedOutcome}</td><td class="${grossClass}">${m.pnl}</td><td class="${netClass}">${netTxt}</td>`;
 }
 
 function prependMove(m){

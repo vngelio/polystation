@@ -98,7 +98,7 @@ pub fn print_dashboard(state: &CopyState, output: OutputFormat) -> Result<()> {
     } else {
         for m in &state.movements {
             println!(
-                "- {} | {} | side={} | outcome={} | leader_px={} | sim_px={} | qty={} | copied={} | diff={}pp | settled={} | pnl={}",
+                "- {} | {} | side={} | outcome={} | leader_px={} | sim_px={} | qty={} | copied={} | diff={}pp | settled={} | resolved={} | pnl={}",
                 m.timestamp,
                 m.market,
                 m.copy_side,
@@ -109,6 +109,11 @@ pub fn print_dashboard(state: &CopyState, output: OutputFormat) -> Result<()> {
                 m.copied_value,
                 m.diff_pct,
                 m.settled,
+                if m.resolved_outcome.is_empty() {
+                    "-"
+                } else {
+                    &m.resolved_outcome
+                },
                 m.pnl
             );
         }
